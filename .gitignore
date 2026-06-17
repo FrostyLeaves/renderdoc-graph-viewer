@@ -1,0 +1,8 @@
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Local scripts and tests
+tools
+tests
