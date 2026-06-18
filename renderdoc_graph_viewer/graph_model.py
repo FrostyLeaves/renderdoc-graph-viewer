@@ -363,25 +363,31 @@ def build_passes(leaves, res_names=None, marker_depth=None, collapsed=None,
     return passes
 
 
-def _bucket_usages(passes, usage_by_res):
-    """Bucket usage events into pass intervals; gap events (renderpass
-    boundary ops) attach to a neighbour: Clear/Discard -> next pass (loadOp),
-    attachment/resolve -> prev pass (storeOp), else nearest (tie -> next).
-    Events before the first / after the last pass are dropped.
+def _bucket_usages(passes, usage_by_res, boundaries=None):
+    """Bucket usage events into pass intervals.
+
+    Gap events use renderpass boundary direction when available, then the
+    usage-name heuristic, then nearest pass. Events outside all passes drop.
 
     -> {res_key: {pass_index: {'r': [(eid, uname)], 'w': [(eid, uname)]}}}
     """
+    boundaries = boundaries or {}
     firsts = [p.first_eid for p in passes]
 
     def find_pass(eid, uname):
         i = bisect.bisect_right(firsts, eid) - 1
         if 0 <= i and passes[i].first_eid <= eid <= passes[i].last_eid:
             return i
-        if 0 <= i and i + 1 < len(passes):  # gap between pass i and i+1
-            if uname in ('Clear', 'Discard'):  # loadOp
+        if 0 <= i and i + 1 < len(passes):
+            bdir = boundaries.get(eid)
+            if bdir == 'end':
+                return i
+            if bdir == 'begin':
+                return i + 1
+            if uname in ('Clear', 'Discard'):
                 return i + 1
             if uname in ('ColorTarget', 'DepthStencilTarget',
-                         'ResolveSrc', 'ResolveDst'):  # storeOp
+                         'ResolveSrc', 'ResolveDst'):
                 return i
             prev_d = eid - passes[i].last_eid
             next_d = passes[i + 1].first_eid - eid
@@ -409,7 +415,7 @@ def _bucket_usages(passes, usage_by_res):
 
 
 def build_graph(passes, usage_by_res, res_info, res_names=None, versioned=False,
-                externally_written=None):
+                externally_written=None, boundaries=None):
     """Build the bipartite pass/resource graph from bucketed usage events.
 
     Merged mode (default): one node per resource; fg.rank_edges is a DAG-safe
@@ -421,12 +427,13 @@ def build_graph(passes, usage_by_res, res_info, res_names=None, versioned=False,
     the frame when scoped).
     usage_by_res: {res_key: [(eventId, usage_name), ...]} any order.
     res_info:     {res_key: {'kind': str, 'info': dict}}.
+    boundaries:   {eid: 'begin'|'end'} for gap usage routing.
     """
     res_names = res_names or {}
     externally_written = externally_written or set()
     fg = FrameGraph()
 
-    slots = _bucket_usages(passes, usage_by_res)
+    slots = _bucket_usages(passes, usage_by_res, boundaries)
 
     # Single writer, no other producer anywhere (here or externally_written):
     # the self-read is conservative UAV noise expressing no dependency, drop it.
@@ -622,6 +629,8 @@ def _collect_leaves(rd, roots, sdfile, key_of):
     debug markers contribute to marker_path - API-structure groupings
     (vkQueueSubmit, render-pass regions, command buffers) are recursed but
     excluded so pass names stay meaningful.
+
+    Returns (leaves, boundaries).
     """
     def flag(name):
         return getattr(rd.ActionFlags, name, 0)
@@ -633,10 +642,13 @@ def _collect_leaves(rd, roots, sdfile, key_of):
     f_present = flag('Present')
     f_push = flag('PushMarker')
     f_multi = flag('MultiAction')
+    f_beginpass = flag('BeginPass')
+    f_endpass = flag('EndPass')
     f_structural = (flag('CmdList') | flag('PassBoundary') | flag('BeginPass') |
                     flag('EndPass') | flag('CommandBufferBoundary'))
 
     leaves = []
+    boundaries = {}
 
     def action_name(act):
         if act.customName:
@@ -660,6 +672,10 @@ def _collect_leaves(rd, roots, sdfile, key_of):
 
     def visit(act, path):
         f = act.flags
+        if f & f_endpass:
+            boundaries[act.eventId] = 'end'
+        elif f & f_beginpass:
+            boundaries[act.eventId] = 'begin'
         kind = None
         if f & f_draw:
             kind = KIND_DRAW
@@ -689,18 +705,22 @@ def _collect_leaves(rd, roots, sdfile, key_of):
             k = key_of(o)
             if k is not None:
                 outs.append(k)
+        copy_src = key_of(act.copySource)
+        if kind == KIND_PRESENT and copy_src is None:
+            # Some APIs expose the presented backbuffer as copyDestination.
+            copy_src = key_of(act.copyDestination)
         leaves.append(LeafAction(
             act.eventId, kind,
             outputs=outs,
             depth_out=key_of(act.depthOut),
             marker_path=path,
             name=action_name(act),
-            copy_src=key_of(act.copySource),
+            copy_src=copy_src,
             copy_dst=key_of(act.copyDestination)))
 
     for a in roots:
         visit(a, ())
-    return leaves
+    return leaves, boundaries
 
 
 def texture_kind_of(cf, texcat, cands=None):
@@ -1327,7 +1347,8 @@ def extract_bundle(controller, include_buffers=True, candidates=None,
             usage_by_res[k] = lst
 
     sdfile = controller.GetStructuredFile()
-    leaves = _collect_leaves(rd, controller.GetRootActions(), sdfile, key_of)
+    leaves, pass_boundaries = _collect_leaves(
+        rd, controller.GetRootActions(), sdfile, key_of)
 
     if depth_access is None:
         leaf_eids = set(l.eid for l in leaves)
@@ -1342,6 +1363,7 @@ def extract_bundle(controller, include_buffers=True, candidates=None,
     return {
         'leaves': leaves,
         'usage_by_res': usage_by_res,
+        'pass_boundaries': pass_boundaries,
         'res_info': res_info,
         'res_names': res_names,
         'rid_objects': rid_objects,
@@ -1360,7 +1382,8 @@ def build_from_bundle(bundle, marker_depth=None, versioned=False,
     passes = build_passes(bundle['leaves'], bundle['res_names'], marker_depth,
                           collapsed=collapsed)
     fg = build_graph(passes, bundle['usage_by_res'], bundle['res_info'],
-                     bundle['res_names'], versioned=versioned)
+                     bundle['res_names'], versioned=versioned,
+                     boundaries=bundle.get('pass_boundaries'))
     fg.warnings = list(bundle['warnings']) + fg.warnings
     fg.rid_objects = bundle['rid_objects']
     fg.stats = {
@@ -1677,7 +1700,8 @@ def build_scoped(bundle, scope_path, scope_range, versioned=True,
     fg = build_graph(passes, scoped_usage, bundle['res_info'],
                      bundle['res_names'], versioned=versioned,
                      externally_written=set(
-                         k for k, (_r, w) in outside.items() if w > 0))
+                         k for k, (_r, w) in outside.items() if w > 0),
+                     boundaries=bundle.get('pass_boundaries'))
     # outside-writer identity: eids writing each resource beyond this scope.
     # Inputs fed by DIFFERENT external writers are different behaviours and
     # must not bundle even though the in-view writer set collapses to empty.

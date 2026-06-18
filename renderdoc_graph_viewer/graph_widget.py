@@ -794,9 +794,9 @@ class GraphPanel(QtWidgets.QWidget):
         self.cfg = _config.load()
         self._cfg_boxes = {}        # cfg key -> QCheckBox
         self._applied_candidates = None  # candidate set of the live bundle
-        # display filters batch too: the rendered graph follows this
-        # snapshot, the checkboxes hold pending edits
+        # Applied snapshots; checkboxes may hold pending edits.
         self._applied_display = _config.display_of(self.cfg)
+        self._applied_features = _config.features_of(self.cfg)
 
         root = QtWidgets.QVBoxLayout(self)
         root.setContentsMargins(2, 2, 2, 2)
@@ -878,9 +878,7 @@ class GraphPanel(QtWidgets.QWidget):
     # ------------------------------------------------------ config band
 
     def _build_config_band(self):
-        """Top configuration band. Display/parse/feature columns apply
-        instantly; the candidates block batches behind [Apply & re-analyze]
-        (a replay round-trip re-reads the capture)."""
+        """Top configuration band. Switches save immediately, then batch."""
         cfg = self.cfg
         pal = self.palette()
         sub = _mix(pal.color(QtGui.QPalette.WindowText),
@@ -1051,13 +1049,12 @@ class GraphPanel(QtWidgets.QWidget):
         self.apply_btn = QtWidgets.QPushButton(tr('Apply'))
         self.apply_btn.setEnabled(False)
         self.apply_btn.setToolTip(tr(
-            'Commit display and candidate changes: display-only changes '
-            're-render instantly; candidate changes re-extract (a replay '
-            'round-trip, seconds), both keeping your navigation position'))
+            'Apply pending changes; candidate changes re-analyze, others '
+            'update the cached graph.'))
         self.reset_btn = QtWidgets.QPushButton(tr('Reset to defaults'))
         self.reset_btn.setToolTip(tr(
-            'Reset all settings to defaults (feature switches take effect '
-            'at once; display and candidate changes still need Apply)'))
+            'Reset all settings to defaults; like any change, click Apply to '
+            'commit them'))
         btns.addWidget(self.cand_hint)
         btns.addWidget(self.apply_btn)
         btns.addWidget(self.reset_btn)
@@ -1090,10 +1087,11 @@ class GraphPanel(QtWidgets.QWidget):
                     _config.KEY_SHOW_ORPHANS, _config.KEY_SHOW_PORTALS):
             wire(self._cfg_boxes[key], key,
                  lambda _on: self._update_dirty())
+        # feature switches batch behind Apply
         wire(self.bundle_cb, _config.KEY_BUNDLING,
-             lambda on: self.callbacks['bundling_toggled'](on))
+             lambda _on: self._update_dirty())
         wire(self.act_unused, _config.KEY_PARSE_SHADER,
-             lambda on: self.callbacks['unused_toggled'](on))
+             lambda _on: self._update_dirty())
 
         for key in self._CANDIDATE_BOX_KEYS:
             wire(self._cfg_boxes[key], key,
@@ -1114,29 +1112,30 @@ class GraphPanel(QtWidgets.QWidget):
         self._update_dirty()
 
     def _dirty_state(self):
-        cand = (self._applied_candidates is not None and
-                _config.candidates_of(self.cfg) !=
-                self._applied_candidates)
-        disp = _config.display_of(self.cfg) != self._applied_display
-        return cand, disp
+        return _config.dirty_flags(
+            self.cfg, self._applied_candidates, self._applied_display,
+            self._applied_features)
 
     def _update_dirty(self):
-        cand_dirty, disp_dirty = self._dirty_state()
-        self.apply_btn.setEnabled(cand_dirty or disp_dirty)
+        cand_dirty, disp_dirty, feat_dirty = self._dirty_state()
+        any_dirty = cand_dirty or disp_dirty or feat_dirty
+        self.apply_btn.setEnabled(any_dirty)
         # only candidate changes need the replay round-trip
         self.apply_btn.setText(tr('Apply & re-analyze') if cand_dirty
                                else tr('Apply'))
-        self.cand_hint.setText(tr('modified →') if (cand_dirty or disp_dirty)
-                               else '')
+        self.cand_hint.setText(tr('modified →') if any_dirty else '')
 
     def _on_apply(self):
-        cand_dirty, disp_dirty = self._dirty_state()
+        cand_dirty, disp_dirty, feat_dirty = self._dirty_state()
+        # Land snapshots before rebuild/re-extract.
         if disp_dirty:
-            # commit display snapshot first so a following re-extraction
-            # rebuild renders with it too
             self._applied_display = _config.display_of(self.cfg)
+        if feat_dirty:
+            self._applied_features = _config.features_of(self.cfg)
         if cand_dirty:
             self.callbacks['candidates_apply']()
+        elif feat_dirty:
+            self.callbacks['features_apply']()
         elif disp_dirty:
             if self.graph is not None:
                 self.set_graph(self.graph, fit=False)

@@ -1,8 +1,8 @@
 # Graph Viewer — RenderDoc 扩展
 
-在 qrenderdoc 中新增一个可停靠窗口，把整帧 capture 解析成交互式的 **frame-graph 风格预览窗口**: 用于快速预览每个 pass(graphics/compute pipeline) 与资源(rt/buffer)之间的关系。
+在 qrenderdoc 中新增一个可停靠窗口，把整帧 capture 解析成交互式的 **frame-graph 风格预览窗口**： 用于快速预览每个 pass(graphics/compute pipeline) 与资源(rt/buffer)之间的关系。
 
-![图例:图中用到的每种节点颜色、形状与边](docs/images/legend.png)
+![图例：图中用到的每种节点颜色、形状与边](docs/images/legend.png)
 
 [English](README.md) · **简体中文**
 
@@ -23,13 +23,13 @@ pass 与资源交替排布，一条边就是一次读或一次写。上面这张
 | <img src="docs/images/node-swapchain.png" height="44"> | **Swapchain**— 帧的最终输出。 |
 | <img src="docs/images/node-external.png" height="44"> | **外部 / 范围输入** — 内容产生于当前视图之外的节点，会额外带有斜线背景，可能是上一帧历史 RT 或者是 CPU 上传的资源。 |
 
-**连线**按方向着色:**绿** 对应读、**红** 对应写，**虚线**表示绑定到管线但 shader 从未采样。
+**连线**按方向着色：**绿** 对应读、**红** 对应写，**虚线**表示绑定到管线但 shader 从未采样。
 
 ## 功能
 
 ### 写入分身
 
-![sub-graph 示例:读写、写入分身、范围输入、传送门](docs/images/core-concepts.png)
+![sub-graph 示例：读写、写入分身、范围输入、传送门](docs/images/core-concepts.png)
 
 在当前 graph 中被多次写入的资源按"写入阶段"拆分为分身节点，每个写入分身代表当前资源在当前graph中是第几次被写入。选中任一分身时全部兄弟分身同步描边。由此整图连线**严格从左向右**，从而避免 graph 结构过于复杂，并明确同一份资源的多次写入顺序。
 
@@ -39,7 +39,7 @@ pass 与资源交替排布，一条边就是一次读或一次写。上面这张
 
 做**同一件事**的节点会归并为一个。归并节点逐行列出全部成员(超 24 项折叠)，**双击某一行直达**。上图中 18 个连续的 `CopyBufferRegion()` 归并为单个 `×18` 节点。
 
-归并算法是启发式的，需同时满足:
+归并算法是启发式的，需同时满足：
 
 1. 边结构完全一致(资源按写入者集合+读取者集合+类别，pass 按读取资源集合+写入资源集合+类别)
 2. 名字启发式相似(按分隔符/驼峰/数字边界切词，首尾词元结构一致、数字归一化)
@@ -53,15 +53,15 @@ pass 与资源交替排布，一条边就是一次读或一次写。上面这张
 
 双击一个 **sub-graph** 节点把它打开以预览该 marker **内部**的 pass 与资源。
 
-双击上图的 **Scene Rendering** 进去，可以看到内部的 pass 结构，以及 Scene Rendering 接受的输入会以外部节点的形式表现在 sub-graph 内部:
+双击上图的 **Scene Rendering** 进去，可以看到内部的 pass 结构，以及 Scene Rendering 接受的输入会以外部节点的形式表现在 sub-graph 内部：
 
-![Scene Rendering 下钻后:与上图相同的 4 输入 2 输出，此刻由边界上的生产者 / 消费者传送门承载](docs/images/feat-scope-in.png)
+![Scene Rendering 下钻后：与上图相同的 4 输入 2 输出，此刻由边界上的生产者 / 消费者传送门承载](docs/images/feat-scope-in.png)
 
 其中，带有相关性的外部 sub-graph 会以**传送门**的形式展示在 sub-graph 中，比如上游的 GBuffer、Shadows，以及下游的 Post FX。
 
-双击传送门即可跳到它代表的外部。例如双击上图的 Post FX 消费者传送门，就会落到 Post FX sub-graph 里，而你刚离开的 sub-graph 此时变成喂入它的生产者传送门:
+双击传送门即可跳到它代表的外部。例如双击上图的 Post FX 消费者传送门，就会落到 Post FX sub-graph 里，而你刚离开的 sub-graph 此时变成喂入它的生产者传送门：
 
-![双击传送门跳转后:落到目标 sub-graph，面包屑随之更新](docs/images/feat-portal-jump.png)
+![双击传送门跳转后：落到目标 sub-graph，面包屑随之更新](docs/images/feat-portal-jump.png)
 
 切换显示选项、归并、预览时保留当前平移与缩放，只有返回/刷新才重新适配。
 
@@ -79,11 +79,9 @@ pass 与资源交替排布，一条边就是一次读或一次写。上面这张
 
 ### 配置面板
 
-![配置面板:显示 / 功能 / 资源候选 三组](docs/images/feat-config.png)
+![配置面板：显示 / 功能 / 资源候选 三组](docs/images/feat-config.png)
 
-配置条从工具栏下拉。显示过滤(外部输入、孤立、传送门、内部集、归并)即时生效。
-
-资源候选规则控制哪些种类的资源会显示出来，需要手动点击Apply按钮才生效，从而避免graph高频刷新。状态持久化到 `%APPDATA%\qrenderdoc\renderdoc_graph_viewer.json`。
+配置条从工具栏下拉。所有开关都批量走 Apply——点击前不会动图。状态持久化到 `%APPDATA%\qrenderdoc\renderdoc_graph_viewer.json`。
 
 ## 安装和使用
 
@@ -91,9 +89,20 @@ pass 与资源交替排布，一条边就是一次读或一次写。上面这张
 
 1. 把 `renderdoc_graph_viewer` 文件夹复制到 `%APPDATA%\qrenderdoc\extensions`，最终形成 `…\qrenderdoc\extensions\renderdoc_graph_viewer\extension.json`。
 
-2. 在 RenderDoc 中:**Tools → Manage Extensions → 勾选 "renderdoc-graph-viewer"**(可同时勾选 Always Load)。
+2. 在 RenderDoc 中：**Tools → Manage Extensions → 勾选 "renderdoc-graph-viewer"**(可同时勾选 Always Load)。
 
-加载 capture 后:**Window → Graph Viewer**，窗口打开时自动解析。
+加载 capture 后：**Window → Graph Viewer**，窗口打开时自动解析。
+
+## 已测试的图形 API
+
+解析与图形后端无关，已测试：
+
+| API | 状态 |
+|---|---|
+| Direct3D 12 | ✅ 已测试 |
+| Direct3D 11 | ✅ 已测试 |
+| Vulkan | ✅ 已测试 |
+| OpenGL | ⚠️ 未测试 |
 
 ## 已知限制
 

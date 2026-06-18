@@ -81,9 +81,7 @@ Optional descriptor-usage analysis dashes the read edge of a resource that is bo
 
 ![The config band: Show / Features / Resource-candidate sections](docs/images/feat-config.png)
 
-The config band drops down from the toolbar. Display filters (external inputs, orphans, portals, internal sets, bundling) apply instantly.
-
-Resource-candidate rules control which resource categories are shown. They only take effect after you manually click Apply, avoiding frequent graph refreshes. State persists to `%APPDATA%\qrenderdoc\renderdoc_graph_viewer.json`.
+The config band drops down from the toolbar. Every switch batches behind Apply — nothing changes the graph until you click it. State persists to `%APPDATA%\qrenderdoc\renderdoc_graph_viewer.json`.
 
 ## Install & usage
 
@@ -94,6 +92,17 @@ Requires an **official RenderDoc build ≥ 1.33** (for its bundled PySide2).
 2. In RenderDoc: **Tools → Manage Extensions → tick "renderdoc-graph-viewer"** (optionally Always Load).
 
 Load a capture, then open **Window → Graph Viewer**. The panel parses the capture automatically when opened.
+
+## Tested graphics APIs
+
+Parsing is backend-agnostic; tested on:
+
+| API | Status |
+|---|---|
+| Direct3D 12 | ✅ Tested |
+| Direct3D 11 | ✅ Tested |
+| Vulkan | ✅ Tested |
+| OpenGL | ⚠️ Not tested |
 
 ## Known limitations
 
