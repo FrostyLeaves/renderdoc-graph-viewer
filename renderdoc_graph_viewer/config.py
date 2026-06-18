@@ -36,7 +36,7 @@ DEFAULTS = {
     KEY_SHOW_INTERNAL: False,   # pure self-RW working sets
     KEY_SHOW_ORPHANS: True,     # passes with no RT dependencies
     KEY_SHOW_PORTALS: True,     # external-scope portal nodes
-    # parse-level (instant, _rebuild from cached bundle)
+    # parse-level features (Apply-gated)
     KEY_BUNDLING: True,         # merge same-behaviour nodes
     # background features
     KEY_PARSE_SHADER: False,    # shader-source parsing: RW de-edge + unused dashing
@@ -65,6 +65,9 @@ CANDIDATE_KEYS = (
 DISPLAY_KEYS = (KEY_SHOW_EXTERNAL, KEY_SHOW_INTERNAL, KEY_SHOW_ORPHANS,
                 KEY_SHOW_PORTALS)
 
+# Apply-gated parse switches.
+FEATURE_KEYS = (KEY_BUNDLING, KEY_PARSE_SHADER)
+
 
 def candidates_of(cfg):
     """The extract-affecting subset; dirty-compare and extract_bundle key
@@ -76,6 +79,24 @@ def display_of(cfg):
     """The display-filter subset; the rendered graph follows the APPLIED
     snapshot, not the live checkboxes."""
     return dict((k, bool(cfg.get(k, DEFAULTS[k]))) for k in DISPLAY_KEYS)
+
+
+def features_of(cfg):
+    """Apply-gated parse switches."""
+    return dict((k, bool(cfg.get(k, DEFAULTS[k]))) for k in FEATURE_KEYS)
+
+
+def dirty_flags(cfg, applied_candidates, applied_display, applied_features):
+    """Return (candidate, display, feature) dirty flags.
+
+    A missing applied snapshot is treated as clean."""
+    cand = (applied_candidates is not None and
+            candidates_of(cfg) != applied_candidates)
+    disp = (applied_display is not None and
+            display_of(cfg) != applied_display)
+    feat = (applied_features is not None and
+            features_of(cfg) != applied_features)
+    return cand, disp, feat
 
 
 def config_path():

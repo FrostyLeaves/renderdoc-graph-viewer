@@ -64,9 +64,8 @@ if qrd is not None:
                 'pass_clicked': self.on_pass_clicked,
                 'resource_double_clicked': self.on_resource_double_clicked,
                 'candidates_apply': self._on_candidates_apply,
-                'bundling_toggled': lambda on: self._rebuild(),
+                'features_apply': self._rebuild,
                 'display_changed': self._on_display_changed,
-                'unused_toggled': self._on_unused_toggled,
                 'member_event_jump': self.on_member_event_jump,
                 'drill': self._on_drill,
                 'navigate': self._on_navigate,
@@ -297,12 +296,6 @@ if qrd is not None:
             self.panel.set_status(text, warnings=warns)
 
         # ----------------------------------------------- unused bindings
-
-        def _on_unused_toggled(self, on):
-            if self.graph is not None:
-                self._rebuild()
-            if on:
-                self._start_binding_scan()
 
         def _start_binding_scan(self):
             # ONE static whole-frame pass (zero replay, descriptor_access.refine
