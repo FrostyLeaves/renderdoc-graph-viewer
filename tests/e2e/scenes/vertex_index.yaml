@@ -1,0 +1,17 @@
+name: vertex_index
+# Indexed draw with three bundled vertex streams and one index buffer.
+bundling: true
+
+resources:
+  Stream0: { kind: vbuffer }
+  Stream1: { kind: vbuffer }
+  Stream2: { kind: vbuffer }
+  Indices: { kind: ibuffer }
+  Albedo:  { kind: color, size: [64, 64], format: rgba8 }
+
+passes:
+  - name: Mesh
+    type: graphics
+    color: [Albedo]
+    vertex: [Stream0, Stream1, Stream2]
+    index: Indices

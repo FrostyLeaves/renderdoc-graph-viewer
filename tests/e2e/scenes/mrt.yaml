@@ -1,0 +1,14 @@
+# Multiple render targets: one graphics pass writing two color attachments plus
+# depth. Exercises >1 ColorTarget on a single draw.
+name: mrt
+
+resources:
+  ColorA: { kind: color, size: [64, 64], format: rgba8 }
+  ColorB: { kind: color, size: [64, 64], format: rgba8 }
+  Depth:  { kind: depth, size: [64, 64], format: d32 }
+
+passes:
+  - name: GBuffer
+    type: graphics
+    color: [ColorA, ColorB]
+    depth: { res: Depth, access: rw }

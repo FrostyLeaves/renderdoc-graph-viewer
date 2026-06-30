@@ -1,0 +1,26 @@
+# Bundling: structurally-equivalent nodes collapse. Clear writes three same-shape
+# resources (Cascade0/1/2 share a name signature, same writer, no readers) -> a
+# resource bundle; Blur x4 are consecutive equivalent write-only passes -> a pass
+# bundle.
+name: bundling
+bundling: true
+
+resources:
+  Cascade0: { kind: buffer, elements: 256 }
+  Cascade1: { kind: buffer, elements: 256 }
+  Cascade2: { kind: buffer, elements: 256 }
+  Work:     { kind: buffer, elements: 256 }
+
+passes:
+  - name: Clear
+    type: compute
+    bind:
+      - { res: Cascade0, bind: uav_buf, access: write }
+      - { res: Cascade1, bind: uav_buf, access: write }
+      - { res: Cascade2, bind: uav_buf, access: write }
+
+  - name: Blur
+    type: compute
+    repeat: 4
+    bind:
+      - { res: Work, bind: uav_buf, access: write }

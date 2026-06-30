@@ -1,0 +1,35 @@
+# Compute chain with every UAV access direction, a storage image and an SRV.
+name: compute_chain
+
+resources:
+  Input:  { kind: buffer,  elements: 256 }
+  Work:   { kind: buffer,  elements: 256 }
+  Accum:  { kind: buffer,  elements: 256 }
+  Out:    { kind: buffer,  elements: 256 }
+  Result: { kind: buffer,  elements: 4 }
+  Image:  { kind: uav_tex, size: [64, 64], format: rgba32f }
+
+passes:
+  - name: Generate
+    type: compute
+    groups: 4
+    bind:
+      - { res: Input, bind: srv_buf, access: read }
+      - { res: Work,  bind: uav_buf, access: write }
+
+  - name: Process
+    type: compute
+    groups: 4
+    bind:
+      - { res: Work,  bind: uav_buf, access: read }
+      - { res: Accum, bind: uav_buf, access: rw }
+      - { res: Out,   bind: uav_buf, access: write }
+      - { res: Image, bind: uav_tex, access: write }
+
+  - name: Reduce
+    type: compute
+    groups: 4
+    bind:
+      - { res: Accum,  bind: uav_buf, access: read }
+      - { res: Out,    bind: uav_buf, access: read }
+      - { res: Result, bind: uav_buf, access: rw }

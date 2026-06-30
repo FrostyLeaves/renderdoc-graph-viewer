@@ -1,0 +1,46 @@
+name: dual_role
+# Dual-role portal split with two drillable "Side" marker instances.
+# Frame reads Shared from Side#0 and writes Output for Side#1.
+resources:
+  Shared: { kind: buffer, elements: 256 }
+  Aux:    { kind: buffer, elements: 256 }
+  Mid:    { kind: buffer, elements: 256 }
+  Output: { kind: buffer, elements: 256 }
+  Tail:   { kind: buffer, elements: 256 }
+  Done:   { kind: buffer, elements: 256 }
+
+passes:
+  - name: Prep
+    scope: [Side]
+    type: compute
+    bind: [ { res: Shared, bind: uav_buf, access: write } ]
+  - name: Seed
+    scope: [Side]
+    type: compute
+    bind: [ { res: Aux, bind: uav_buf, access: write } ]
+
+  - name: InnerA
+    scope: [Frame]
+    type: compute
+    bind:
+      - { res: Shared, bind: uav_buf, access: read }    # producer portal (Side#0)
+      - { res: Mid, bind: uav_buf, access: write }
+  - name: InnerB
+    scope: [Frame]
+    type: compute
+    bind:
+      - { res: Mid, bind: uav_buf, access: read }
+      - { res: Output, bind: uav_buf, access: write }   # consumed after Frame
+
+  - name: Collect
+    scope: [Side]
+    type: compute
+    bind:
+      - { res: Output, bind: uav_buf, access: read }     # consumer portal (Side#1)
+      - { res: Tail, bind: uav_buf, access: write }
+  - name: Finish
+    scope: [Side]
+    type: compute
+    bind:
+      - { res: Tail, bind: uav_buf, access: read }
+      - { res: Done, bind: uav_buf, access: write }

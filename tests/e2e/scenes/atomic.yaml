@@ -1,0 +1,23 @@
+# Atomic read-modify-write: Count accumulates into Counter via InterlockedAdd
+# (still classified rw), Drain reads Counter so the write edge stays visible.
+# Exercises the shader parsers' InterlockedAdd recognition across SPIR-V/DXBC/DXIL
+# -- the graph is identical to a plain rw, but the bytecode is the atomic form.
+name: atomic
+
+resources:
+  Input:   { kind: buffer, elements: 256 }
+  Counter: { kind: buffer, elements: 4 }
+  Out:     { kind: buffer, elements: 256 }
+
+passes:
+  - name: Count
+    type: compute
+    bind:
+      - { res: Input,   bind: srv_buf, access: read }
+      - { res: Counter, bind: uav_buf, access: rw, atomic: true }
+
+  - name: Drain
+    type: compute
+    bind:
+      - { res: Counter, bind: uav_buf, access: read }
+      - { res: Out,     bind: uav_buf, access: write }

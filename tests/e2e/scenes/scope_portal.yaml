@@ -1,0 +1,35 @@
+# Scope drill-down + portals: passes under the "Frame" marker form a sub-graph.
+# Shared is produced outside Frame, and Final is consumed outside Frame.
+# The verifier walks the Frame level and checks its portals.
+name: scope_portal
+
+resources:
+  Shared: { kind: buffer, elements: 256 }
+  Inner:  { kind: buffer, elements: 256 }
+  Final:  { kind: buffer, elements: 256 }
+
+passes:
+  - name: Produce
+    type: compute
+    bind:
+      - { res: Shared, bind: uav_buf, access: write }
+
+  - name: InnerA
+    scope: [Frame]
+    type: compute
+    bind:
+      - { res: Shared, bind: uav_buf, access: read }   # producer portal target
+      - { res: Inner,  bind: uav_buf, access: write }
+
+  - name: InnerB
+    scope: [Frame]
+    type: compute
+    bind:
+      - { res: Inner, bind: uav_buf, access: read }
+      - { res: Final, bind: uav_buf, access: write }    # consumed after Frame
+
+  - name: Consume
+    type: compute
+    bind:
+      - { res: Final, bind: uav_buf, access: read }     # consumer portal
+      - { res: Inner, bind: uav_buf, access: write }

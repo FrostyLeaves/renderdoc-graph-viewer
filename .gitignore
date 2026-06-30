@@ -1,0 +1,7 @@
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Developer-only probe scripts and local capture paths (not shipped)
+tools/
