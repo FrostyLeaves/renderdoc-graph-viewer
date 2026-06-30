@@ -1,6 +1,6 @@
 # Dev/test dependencies for the headless unit suite (what CI installs).
 #
 # PySide2 is intentionally not listed: it only enables the Qt widget tests in
-# tests/test_widget.py, which skip cleanly when it is absent. PyYAML is needed
-# only to regenerate the GPU e2e scenes (tests/e2e), not for the suite.
+# tests/test_widget.py, which skip cleanly when it is absent.
 pytest>=7.0
+PyYAML>=6.0
