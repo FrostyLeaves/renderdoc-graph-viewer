@@ -1,0 +1,24 @@
+# Frame-prior descriptors: descriptors/views exist outside the captured frame.
+# The graph matches the same compute chain with in-frame descriptors.
+name: frame_prior
+frame_prior: true
+
+resources:
+  Input: { kind: buffer, elements: 256 }
+  Work:  { kind: buffer, elements: 256 }
+  Accum: { kind: buffer, elements: 256 }
+  Out:   { kind: buffer, elements: 256 }
+
+passes:
+  - name: Generate
+    type: compute
+    bind:
+      - { res: Input, bind: srv_buf, access: read }
+      - { res: Work,  bind: uav_buf, access: write }
+
+  - name: Process
+    type: compute
+    bind:
+      - { res: Work,  bind: uav_buf, access: read }
+      - { res: Accum, bind: uav_buf, access: rw }
+      - { res: Out,   bind: uav_buf, access: write }

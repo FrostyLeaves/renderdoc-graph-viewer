@@ -1,0 +1,16 @@
+# D3D12 capture-end Present uses the last written color output as its source.
+name: present_d3d12
+
+resources:
+  Backbuffer: { kind: swapchain, size: [64, 64], format: rgba8 }
+  BufferedRT: { kind: color, size: [64, 64], format: rgba8 }
+
+passes:
+  - name: FillBufferedRT
+    type: graphics
+    color: [BufferedRT]
+
+  - name: Present
+    type: present
+    marker: false
+    swapchain: BufferedRT

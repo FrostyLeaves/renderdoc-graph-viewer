@@ -1,0 +1,34 @@
+# Generation collapse with bundled Cascade resources across four write generations.
+name: generations
+bundling: true
+
+resources:
+  Cascade0: { kind: buffer, elements: 256 }
+  Cascade1: { kind: buffer, elements: 256 }
+  Cascade2: { kind: buffer, elements: 256 }
+
+passes:
+  - name: GenA
+    type: compute
+    bind:
+      - { res: Cascade0, bind: uav_buf, access: rw }
+      - { res: Cascade1, bind: uav_buf, access: rw }
+      - { res: Cascade2, bind: uav_buf, access: rw }
+  - name: GenB
+    type: compute
+    bind:
+      - { res: Cascade0, bind: uav_buf, access: rw }
+      - { res: Cascade1, bind: uav_buf, access: rw }
+      - { res: Cascade2, bind: uav_buf, access: rw }
+  - name: GenC
+    type: compute
+    bind:
+      - { res: Cascade0, bind: uav_buf, access: rw }
+      - { res: Cascade1, bind: uav_buf, access: rw }
+      - { res: Cascade2, bind: uav_buf, access: rw }
+  - name: GenD
+    type: compute
+    bind:
+      - { res: Cascade0, bind: uav_buf, access: rw }
+      - { res: Cascade1, bind: uav_buf, access: rw }
+      - { res: Cascade2, bind: uav_buf, access: rw }

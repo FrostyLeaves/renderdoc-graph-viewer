@@ -1,0 +1,17 @@
+name: cbv
+# A constant buffer feeding a compute pass exercises the CS_Constants read edge,
+# distinct from the structured/storage-buffer read path. The cbv read feeds the
+# uav write so it is not dead-stripped. Constant buffers are RES_BUFFER in the
+# viewer (RenderDoc reports them as plain buffers), so the oracle treats Params
+# like any other buffer node; only the runtime creates it as a constant/uniform
+# buffer and binds it through the cbv slot.
+resources:
+  Params: { kind: cbuffer, elements: 64 }
+  Out:    { kind: buffer,  elements: 256 }
+passes:
+  - name: Apply
+    type: compute
+    groups: 4
+    bind:
+      - { res: Params, bind: cbv,     access: read }
+      - { res: Out,    bind: uav_buf, access: write }

@@ -10,15 +10,15 @@ try:
 except ImportError:  # outside RenderDoc (unit tests / tooling)
     qrd = None
 
-from . import binding_scan
 from . import graph_model
-from . import thumbnails
+from . import navigation
+from . import config as _config
+from .ui import thumbnails
+from .ui import status
 from .i18n import tr
 
 extiface_version = ''
 cur_window = None
-
-NAV_HISTORY_LIMIT = 50   # back-navigation snapshots kept (bounded)
 
 
 if qrd is not None:
@@ -32,38 +32,25 @@ if qrd is not None:
             self.generation = 0
             self.graph = None
             self.bundle = None  # cached extraction; scope changes re-group locally
-            self.scope_stack = []  # [{label, path, range}]
-            self.nav_history = []
+            self.nav = navigation.NavigationState()
             self._last_scope_key = ('__init__',)  # forces fit on first build
             self.thumb_job = None
             self.thumb_epoch = 0     # bumped per rebuild; retires stale jobs
             self.thumb_failed = set()  # SaveTexture failed; no retry
             self._thumb_pending = {}   # {key: autofit} queued while a job flies
             self._retired_jobs = []
-            self.binding_job = None
-            self.shader_access = {}  # (eid, res_key) -> 'unused'|'read'|'write'|'rw'
-            # whether the whole-frame scan has completed; distinct from an empty
-            # shader_access (a scan that resolved 0 verdicts -- e.g. a bindless
-            # D3D12 capture -- is still "done" and must NOT be relaunched)
-            self._binding_ready = False
-            # diagnostics from the last shader-access pass; non-empty means the
-            # static refinement genuinely failed (vs resolved 0 verdicts) and
-            # the graph fell back to conservative RW edges
-            self._binding_warnings = []
-            # static depth-access pass, reused across re-extractions of the
-            # same capture+candidate set; dropped on candidate change
-            # (_on_candidates_apply) and capture switch
-            self._depth_cache = None
+            # static refinement payloads for the current capture+candidate set
+            self._refinement_cache = None
 
             self.topWindow = self.mqt.CreateToplevelWidget(
                 'Graph Viewer', lambda c, w, d: _window_closed())
 
-            from . import graph_widget
+            from .ui import graph_widget
             self.panel = graph_widget.GraphPanel({
                 'refresh': self.refresh,
                 'pass_clicked': self.on_pass_clicked,
                 'resource_double_clicked': self.on_resource_double_clicked,
-                'candidates_apply': self._on_candidates_apply,
+                'extract_apply': self._on_extract_apply,
                 'features_apply': self._rebuild,
                 'display_changed': self._on_display_changed,
                 'member_event_jump': self.on_member_event_jump,
@@ -86,37 +73,23 @@ if qrd is not None:
 
         # -------------------------------------------------------- refresh
 
-        def _push_history(self):
-            # snapshot the viewpoint too so back restores exact pan/zoom
-            self.nav_history.append({
-                'stack': list(self.scope_stack),
-                'view': self.panel.capture_view_state(),
-            })
-            del self.nav_history[:-NAV_HISTORY_LIMIT]  # bounded
-            self.panel.set_back_enabled(True)
-
         def _on_back(self):
-            if not self.nav_history:
+            if not self.nav.can_back:
                 return
-            snap = self.nav_history.pop()
-            self.scope_stack = snap['stack']
-            self.panel.set_back_enabled(bool(self.nav_history))
+            view = self.nav.back()
+            self.panel.set_back_enabled(self.nav.can_back)
             self._rebuild()
-            self.panel.restore_view_state(snap['view'])
+            self.panel.restore_view_state(view)
 
         def _on_drill(self, node):
-            self._push_history()
-            self.scope_stack.append({
-                'label': node.name,
-                'path': tuple(node.marker_path),
-                'range': (node.first_eid, node.last_eid),
-            })
+            self.nav.drill(node, self.panel.capture_view_state())
+            self.panel.set_back_enabled(self.nav.can_back)
             self._rebuild()
 
         def _on_navigate(self, index):
             # breadcrumb index 0 == whole-frame root
-            self._push_history()
-            del self.scope_stack[max(0, index):]
+            self.nav.navigate(index, self.panel.capture_view_state())
+            self.panel.set_back_enabled(self.nav.can_back)
             self._rebuild()
 
         def _on_jump_scope(self, node, focus_eid=None):
@@ -132,8 +105,8 @@ if qrd is not None:
                     self.bundle, path, node.first_eid)
                 if not chain:
                     return  # could not resolve the instance ancestry
-            self._push_history()
-            self.scope_stack = chain
+            self.nav.jump(chain, self.panel.capture_view_state())
+            self.panel.set_back_enabled(self.nav.can_back)
             self._rebuild()
             feid = focus_eid
             if feid is None:
@@ -141,30 +114,24 @@ if qrd is not None:
             if feid is not None:
                 self.panel.focus_event(feid)
 
-        def _on_candidates_apply(self):
-            # The candidate gate decides which resources reach usage_by_res,
-            # and the depth-access cache is built from exactly that set. A
-            # candidate change can make the cache incomplete (e.g. depth
-            # targets re-admitted after a prior depth-off extraction), so drop
-            # it and let the re-extraction recompute the static pass.
-            self._depth_cache = None
-            self.refresh(keep_scope=True)
+        def _on_extract_apply(self, candidates, display, features):
+            # Refinement caches are built from exactly the admitted
+            # resource set, so drop it whenever extraction inputs change.
+            self._refinement_cache = None
+            self.refresh(keep_scope=True, candidates=candidates,
+                         display=display, features=features)
 
-        def refresh(self, keep_scope=False):
-            # keep_scope=True: re-extract without losing navigation state;
-            # only a capture change resets it
+        def refresh(self, keep_scope=False, candidates=None, display=None,
+                    features=None):
+            # keep_scope keeps the active navigation stack during re-extraction
             self.generation += 1
             gen = self.generation
             self._cancel_thumbs()
             self.panel.clear_thumbnails()
             self.thumb_failed.clear()
-            self.shader_access.clear()  # eids change with the capture
-            self._binding_ready = False
-            self._binding_warnings = []
             self.bundle = None
             if not keep_scope:
-                del self.scope_stack[:]
-                del self.nav_history[:]
+                self.nav.reset()
                 self.panel.set_back_enabled(False)
                 self._last_scope_key = ('__refresh__',)
 
@@ -179,8 +146,13 @@ if qrd is not None:
                 self.panel.set_status('')
                 return
 
-            candidates = self.panel.candidate_config()
-            depth_cache = self._depth_cache
+            if candidates is None:
+                candidates = self.panel.candidate_config()
+            if features is None:
+                features = self.panel.feature_config()
+            parse_shaders = bool(features.get(
+                _config.KEY_PARSE_SHADER, _config.DEFAULTS[_config.KEY_PARSE_SHADER]))
+            refinement_cache = self._refinement_cache
             self.panel.set_status(tr('Analyzing…'))
 
             def progress(done, total):
@@ -196,50 +168,46 @@ if qrd is not None:
                 try:
                     bundle = graph_model.extract_bundle(
                         controller, candidates=candidates,
-                        depth_access=depth_cache, progress=progress)
+                        refinement_cache=refinement_cache, progress=progress,
+                        parse_shaders=parse_shaders)
                 except Exception:
                     import traceback
                     err = traceback.format_exc()
                     self.mqt.InvokeOntoUIThread(lambda e=err: self._on_error(gen, e))
                     return
                 self.mqt.InvokeOntoUIThread(
-                    lambda b=bundle: self._on_bundle(gen, b, candidates))
+                    lambda b=bundle: self._on_bundle(
+                        gen, b, candidates, display, features))
 
             self.ctx.Replay().AsyncInvoke('rt_dep_graph_extract', work)
 
-        def _on_bundle(self, gen, bundle, candidates=None):
+        def _on_bundle(self, gen, bundle, candidates=None, display=None,
+                       features=None):
             if gen != self.generation:
                 return
             self.bundle = bundle
-            self._depth_cache = bundle.get('depth_access')
+            self._refinement_cache = bundle.get('refinement_cache')
             if candidates is not None:
-                # mark applied only on success; a failed extraction keeps
-                # the pending-apply hint alive
+                # applied candidate snapshot for the landed bundle
                 self.panel.set_candidates_applied(candidates)
+            if display is not None:
+                self.panel.set_display_applied(display)
+            if features is not None:
+                self.panel.set_features_applied(features)
             self._rebuild()
 
         def _rebuild(self):
             # re-group from the cached bundle; no replay round-trip
             if self.bundle is None:
                 return
-            # retire the previous scope's thumbnail batch; _on_thumbs_done
-            # relaunches for the new scope's gaps
+            # new scope/view generation for thumbnail jobs
             self.thumb_epoch += 1
-            if self.scope_stack:
-                cur = self.scope_stack[-1]
-                scope_path, scope_range = cur['path'], cur['range']
-            else:
-                scope_path, scope_range = (), None
+            scope_path, scope_range = self.nav.current_scope()
             try:
-                # bundling lives in the parse layer: graph, portal targets
-                # and jump focus all come from one merged result
-                sa = self.shader_access if self.panel.act_unused.isChecked() else {}
+                # scoped graph plus portal jump targets
                 fg = graph_model.build_scoped(
                     self.bundle, scope_path, scope_range,
-                    bundling=self.panel.bundling_enabled(),
-                    shader_access=sa)
-                # cached verdicts dash edges now; gaps scanned below
-                graph_model.apply_binding_usage(fg, sa)
+                    bundling=self.panel.bundling_enabled())
             except Exception:
                 import traceback
                 self._on_error(self.generation, traceback.format_exc())
@@ -249,11 +217,9 @@ if qrd is not None:
             fit = scope_key != self._last_scope_key
             self._last_scope_key = scope_key
             self.panel.set_breadcrumb(
-                [tr('Whole frame')] + [s['label'] for s in self.scope_stack])
+                [tr('Whole frame')] + self.nav.labels())
             self.panel.set_graph(fg, fit=fit)
             self._update_status()
-            if self.panel.act_unused.isChecked():
-                self._start_binding_scan()
 
         def _on_error(self, gen, err):
             if gen != self.generation:
@@ -269,65 +235,13 @@ if qrd is not None:
             if self.graph is None:
                 self.panel.set_status('')
                 return
-            s = self.graph.stats
-            text = '%d passes · %d resources · %d edges · %.2fs' % (
-                s.get('passes', 0), s.get('resources', 0),
-                s.get('edges', 0), s.get('seconds', 0.0))
-            hc = getattr(self.panel, 'hidden_counts', {})
-            parts = []
-            if hc.get('orphans'):
-                parts.append(tr('orphans %d') % hc['orphans'])
-            if hc.get('external'):
-                parts.append(tr('external %d') % hc['external'])
-            if hc.get('internal'):
-                parts.append(tr('internal %d') % hc['internal'])
-            if parts:
-                text += tr(' · hidden: ') + u' / '.join(parts)
-            # union (never mutate) the model, layout and shader-access warnings;
-            # layout/binding live off the graph so revisiting a view can't
-            # double-count them
+            # combine model and current-view warnings without mutating graph state
             warns = list(self.graph.warnings)
             warns += getattr(self.panel, 'layout_warnings', None) or []
-            warns += self._binding_warnings
-            if warns:
-                text += u' · %d warnings' % len(warns)
-            if extra:
-                text += ' · ' + extra
+            text = status.format_status(
+                self.graph.stats, getattr(self.panel, 'hidden_counts', {}),
+                warns, extra)
             self.panel.set_status(text, warnings=warns)
-
-        # ----------------------------------------------- unused bindings
-
-        def _start_binding_scan(self):
-            # ONE static whole-frame pass (zero replay, descriptor_access.refine
-            # — replaces the old ~86ms/event SetFrameEvent walk). Computed once
-            # per capture, cached across scope navigation, cleared by refresh.
-            if (self.graph is None or self.binding_job is not None or
-                    not self.panel.act_unused.isChecked() or self._binding_ready):
-                return
-            gen = self.generation
-            self._update_status(tr('Refining read/write access…'))
-            job = binding_scan.ShaderAccessJob(
-                self.ctx, self.mqt,
-                is_alive=lambda: (gen == self.generation and
-                                  self.panel.act_unused.isChecked()),
-                on_done=lambda res, w: self._on_binding_scan_done(gen, res, w))
-            self.binding_job = job
-            job.start()
-
-        def _on_binding_scan_done(self, gen, results, warnings=()):
-            self.binding_job = None
-            if gen != self.generation:
-                return  # re-extracted: eids/rids are stale
-            self.shader_access = results   # whole-frame static result, complete
-            self._binding_warnings = list(warnings)
-            # latch ready even on failure (and even on a 0-verdict result): the
-            # failure is deterministic, so an auto-relaunch would just loop.
-            # Re-analyze clears _binding_ready and retries; the warning tells the
-            # user the graph fell back to conservative RW edges meanwhile.
-            self._binding_ready = True
-            if self.graph is not None:
-                self._rebuild()   # rebuild applies the de-edge refinement
-            self._update_status()
 
         # ----------------------------------------------------- thumbnails
 
@@ -343,31 +257,30 @@ if qrd is not None:
             # one node per job, so each carries its own autofit
             if self.graph is None or self.thumb_job is not None:
                 return
-            while self._thumb_pending:
-                key, autofit = self._thumb_pending.popitem()
-                if self.panel.has_thumbnail(key) or key in self.thumb_failed:
-                    continue
-                rid = self.graph.rid_objects.get(key[0])
-                if rid is None:
-                    continue
-                gen = self.generation
-                epoch = self.thumb_epoch
-                restore = None
-                try:
-                    restore = self.ctx.CurSelectedEvent()
-                except Exception:
-                    pass
-                self.panel.set_thumb_loading([key])
-                job = thumbnails.ThumbnailJob(
-                    self.ctx, self.mqt, [(key, rid, key[1])], restore,
-                    is_alive=lambda: (gen == self.generation and
-                                      epoch == self.thumb_epoch),
-                    on_thumb=lambda k, p: self._on_thumb(gen, k, p),
-                    on_done=lambda: self._on_thumbs_done(gen),
-                    autofit=autofit)
-                self.thumb_job = job
-                job.start()
+            sel = thumbnails.select_next_thumb(
+                self._thumb_pending,
+                lambda k: self.panel.has_thumbnail(k) or k in self.thumb_failed,
+                lambda k: self.graph.rid_objects.get(k[0]))
+            if sel is None:
                 return
+            key, autofit, rid = sel
+            gen = self.generation
+            epoch = self.thumb_epoch
+            restore = None
+            try:
+                restore = self.ctx.CurSelectedEvent()
+            except Exception:
+                pass
+            self.panel.set_thumb_loading([key])
+            job = thumbnails.ThumbnailJob(
+                self.ctx, self.mqt, [(key, rid, key[1])], restore,
+                is_alive=lambda: (gen == self.generation and
+                                  epoch == self.thumb_epoch),
+                on_thumb=lambda k, p: self._on_thumb(gen, k, p),
+                on_done=lambda: self._on_thumbs_done(gen),
+                autofit=autofit)
+            self.thumb_job = job
+            job.start()
 
         def _on_thumb(self, gen, key, path):
             if gen != self.generation:
@@ -376,7 +289,7 @@ if qrd is not None:
                 self.thumb_failed.add(key)  # depth/MSAA etc.: don't retry
                 self.panel.set_thumb_failed(key)
                 return
-            # keys are stable across scopes: an old-scope grab still applies
+            # key is stable across scope views
             self.panel.set_thumbnail(key, path)
 
         def _on_thumbs_done(self, gen):
@@ -454,7 +367,7 @@ if qrd is not None:
         # -------------------------------------------------- CaptureViewer
 
         def OnCaptureLoaded(self):
-            self._depth_cache = None  # eids/previews belong to the old capture
+            self._refinement_cache = None  # capture-local payloads
             self.panel.clear_expanded()
             self._thumb_pending = {}
             self.refresh()
@@ -463,14 +376,10 @@ if qrd is not None:
             self.generation += 1
             self._cancel_thumbs()
             self.thumb_failed.clear()
-            self.shader_access.clear()
-            self._binding_ready = False
-            self._binding_warnings = []
-            self._depth_cache = None
+            self._refinement_cache = None
             self.graph = None
             self.bundle = None
-            del self.scope_stack[:]
-            del self.nav_history[:]
+            self.nav.reset()
             self.panel.set_back_enabled(False)
             self._last_scope_key = ('__closed__',)
             self.panel.set_breadcrumb([tr('Whole frame')])
@@ -501,7 +410,7 @@ if qrd is not None:
         global cur_window
         if cur_window is None:
             try:
-                from . import graph_widget  # noqa: F401 - probe PySide2
+                from .ui import graph_widget  # noqa: F401 - probe PySide2
             except ImportError:
                 ctx.Extensions().ErrorDialog(
                     'PySide2 is not available in this RenderDoc build.\n\n'

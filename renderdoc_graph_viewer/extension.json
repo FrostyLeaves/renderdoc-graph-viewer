@@ -1,7 +1,7 @@
 {
     "extension_api": 1,
     "name": "renderdoc-graph-viewer",
-    "version": "0.0.2",
+    "version": "0.0.4",
     "minimum_renderdoc": "1.33",
     "description": "Preview a RenderDoc capture as an interactive frame graph of graphics, compute, present, resource, and buffer read/write dependencies.\n\nMarker sub-graphs and portals, write-versioned resources, behavior bundling, Event Browser sync, optional shader-usage refinement, and on-demand thumbnails.",
     "author": "FrostyLeaves",

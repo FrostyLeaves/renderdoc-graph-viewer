@@ -8,15 +8,13 @@ DEFAULTS rather than taking down the UI.
 import json
 import os
 
-# Config keys. These strings are also the JSON field names, so their
-# values must stay stable across releases (renaming a constant is fine,
-# changing its string value orphans existing saved configs).
+# Config keys and JSON field names.
 KEY_SHOW_EXTERNAL = 'show_external'
 KEY_SHOW_INTERNAL = 'show_internal'
 KEY_SHOW_ORPHANS = 'show_orphans'
 KEY_SHOW_PORTALS = 'show_portals'
 KEY_BUNDLING = 'bundling'
-KEY_PARSE_SHADER = 'unused_scan'   # shader-source parsing / RW de-edge; value kept for back-compat
+KEY_PARSE_SHADER = 'parse_shader_access'
 KEY_TEX_COLOR = 'tex_color'
 KEY_TEX_DEPTH = 'tex_depth'
 KEY_TEX_RW = 'tex_rw'
@@ -28,19 +26,18 @@ KEY_BUF_VERTEX_INDEX = 'buf_vertex_index'
 KEY_BUF_CONSTANTS = 'buf_constants'
 KEY_BUF_NOFLAGS = 'buf_noflags'
 
-# Factory defaults: all candidate classes admitted, external inputs and
-# orphans shown, internal working sets hidden.
+# Factory defaults: all candidate classes admitted, orphans shown, external
+# inputs and internal working sets hidden.
 DEFAULTS = {
     # display filters (batch-applied)
-    KEY_SHOW_EXTERNAL: True,    # read-only-in-frame resources
+    KEY_SHOW_EXTERNAL: False,   # read-only-in-frame resources
     KEY_SHOW_INTERNAL: False,   # pure self-RW working sets
     KEY_SHOW_ORPHANS: True,     # passes with no RT dependencies
     KEY_SHOW_PORTALS: True,     # external-scope portal nodes
     # parse-level features (Apply-gated)
     KEY_BUNDLING: True,         # merge same-behaviour nodes
-    # background features
-    KEY_PARSE_SHADER: False,    # shader-source parsing: RW de-edge + unused dashing
-    # resource candidates (re-extraction required).
+    KEY_PARSE_SHADER: False,    # shader parsing and unused-binding dashing
+    # resource candidates (applied by extraction)
     # Textures: which creationFlags classes may enter the graph.
     KEY_TEX_COLOR: True,
     KEY_TEX_DEPTH: True,

@@ -1,0 +1,18 @@
+# Bound-but-unused shader binding: Probe binds A without reading it.
+name: unused
+
+resources:
+  A: { kind: buffer, elements: 256 }
+  B: { kind: buffer, elements: 256 }
+
+passes:
+  - name: Write
+    type: compute
+    bind:
+      - { res: A, bind: uav_buf, access: write }
+
+  - name: Probe
+    type: compute
+    bind:
+      - { res: A, bind: uav_buf, access: none }
+      - { res: B, bind: uav_buf, access: write }

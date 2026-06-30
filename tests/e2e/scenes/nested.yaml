@@ -1,0 +1,39 @@
+# Three-level drill-down: Frame > {Geometry, Lighting}, each with two passes so
+# the sub-scopes are themselves drillable. The recursive verifier walks root ->
+# Frame -> Geometry and Frame -> Lighting. GA/GB are produced in Geometry and
+# consumed in Lighting, so the sub-scope levels also carry producer/consumer
+# portals. The merged view groups everything by full marker path.
+name: nested
+
+resources:
+  GA: { kind: buffer, elements: 256 }
+  GB: { kind: buffer, elements: 256 }
+  LA: { kind: buffer, elements: 256 }
+  LB: { kind: buffer, elements: 256 }
+
+passes:
+  - name: GBufA
+    scope: [Frame, Geometry]
+    type: compute
+    bind:
+      - { res: GA, bind: uav_buf, access: write }
+
+  - name: GBufB
+    scope: [Frame, Geometry]
+    type: compute
+    bind:
+      - { res: GB, bind: uav_buf, access: write }
+
+  - name: LightA
+    scope: [Frame, Lighting]
+    type: compute
+    bind:
+      - { res: GA, bind: uav_buf, access: read }
+      - { res: LA, bind: uav_buf, access: write }
+
+  - name: LightB
+    scope: [Frame, Lighting]
+    type: compute
+    bind:
+      - { res: GB, bind: uav_buf, access: read }
+      - { res: LB, bind: uav_buf, access: write }

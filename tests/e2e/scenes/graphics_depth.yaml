@@ -1,0 +1,22 @@
+# Graphics + depth coverage: a depth-prepass (depth write-only) then a shading
+# pass (color write + depth test/write + a sampled SRV read). Exercises color /
+# depth / sampled resource kinds, the graphics pass category, and depth
+# read/write/rw refinement (DepthStencilTarget -> DepthTestRead/RW per state).
+name: graphics_depth
+
+resources:
+  Albedo: { kind: color,   size: [64, 64], format: rgba8 }
+  Depth:  { kind: depth,   size: [64, 64], format: d32 }
+  Tex:    { kind: sampled, size: [64, 64], format: rgba8 }
+
+passes:
+  - name: DepthPre
+    type: graphics
+    depth: { res: Depth, access: write }
+
+  - name: Shade
+    type: graphics
+    color: [Albedo]
+    depth: { res: Depth, access: rw }
+    sample:
+      - { res: Tex, bind: sampled, access: read }

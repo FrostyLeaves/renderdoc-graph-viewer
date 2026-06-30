@@ -1,0 +1,7 @@
+# Pytest configuration for the headless suite.
+
+[tool.pytest.ini_options]
+minversion = "7.0"
+testpaths = ["tests"]
+# GPU end-to-end scenes run through qrenderdoc, outside pytest.
+norecursedirs = [".*", "build", "dist", "*.egg", "_build", "e2e"]

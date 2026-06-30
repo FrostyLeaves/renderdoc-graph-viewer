@@ -6,9 +6,8 @@ Active language follows the system locale (QLocale); _TRANSLATIONS is empty
 so every locale currently shows English.
 """
 
-# Add a language by inserting a {source: translation} table keyed by locale,
-# e.g. 'zh': {'Refresh': u'刷新', 'Config': u'配置', ...}; untranslated strings
-# fall back to the English source (see tr()).
+# Add a language by inserting a {source: translation} table keyed by locale.
+# Untranslated strings fall back to the English source (see tr()).
 _TRANSLATIONS = {}
 
 _lang = None
@@ -35,4 +34,4 @@ def tr(s):
     if _lang is None:
         _lang = _detect_lang()
     return _TRANSLATIONS.get(_lang, {}).get(s, s)
-    
+
