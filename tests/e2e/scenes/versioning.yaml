@@ -1,0 +1,25 @@
+# Versioning: a buffer written, then read, then written again becomes two version
+# nodes (build_graph splits on write-after-read). Refined mode keeps the chain
+# clean so each read points at its producing write.
+name: versioning
+
+resources:
+  Buf: { kind: buffer, elements: 256 }
+  Tmp: { kind: buffer, elements: 256 }
+
+passes:
+  - name: WriteA
+    type: compute
+    bind:
+      - { res: Buf, bind: uav_buf, access: write }
+
+  - name: ReadB
+    type: compute
+    bind:
+      - { res: Buf, bind: uav_buf, access: read }
+      - { res: Tmp, bind: uav_buf, access: write }   # sink so the read stays live
+
+  - name: WriteC
+    type: compute
+    bind:
+      - { res: Buf, bind: uav_buf, access: write }    # write-after-read -> Buf v2

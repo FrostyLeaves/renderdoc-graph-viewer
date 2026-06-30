@@ -1,0 +1,12 @@
+_build/
+*.rdc
+*.exe
+*.obj
+*.spv
+*.dxbc
+*.dxil
+*.cso
+*.pdb
+*.ilk
+*.lib
+*.exp

@@ -1,0 +1,21 @@
+# Markerless passes: no debug label, so build_passes falls back to fine-grouping
+# (Compute #N naming) instead of marker-based grouping. Two dispatches writing
+# different buffers stay separate fine groups.
+name: markerless
+
+resources:
+  A: { kind: buffer, elements: 256 }
+  B: { kind: buffer, elements: 256 }
+
+passes:
+  - name: GenA
+    type: compute
+    marker: false
+    bind:
+      - { res: A, bind: uav_buf, access: write }
+
+  - name: GenB
+    type: compute
+    marker: false
+    bind:
+      - { res: B, bind: uav_buf, access: write }

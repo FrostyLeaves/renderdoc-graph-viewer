@@ -10,9 +10,13 @@ import time
 from .i18n import tr
 
 from . import config as _config
-# shared structured-data accessors; _child_int is the same defensive int reader
-# descriptor_access uses (_ci)
-from ._sdutil import _ci as _child_int, _rid_str
+from .parse.usage_access import READ, WRITE, RW, IGNORE, USAGE_ACCESS
+from .parse import usage_access
+from .parse import usage_cleanup
+from .parse import depth_access
+from .parse import shader_refinement
+from .parse import apis
+from .parse import action_flags
 
 # Names matching this are raw-API-call groupings (vkCmd...(...)), not semantic markers.
 _API_CALL_RE = re.compile(r'^(vk|gl|wgl|egl)[A-Za-z0-9_]*\(')
@@ -20,11 +24,6 @@ _STRUCTURAL_NAME_PREFIXES = (
     'ExecuteCommandList', 'Command Buffer', 'CommandBuffer', 'API Calls',
 )
 
-READ = 'read'
-WRITE = 'write'
-RW = 'rw'
-IGNORE = 'ignore'
-ACCESS_NONE = 'none'   # depth-access result: no attachment bound (distinct from IGNORE)
 EDGE_RANK = 'rank'     # Edge.kind for a layout-only ordering edge (besides READ / WRITE)
 
 # Action kinds (LeafAction.kind).
@@ -54,72 +53,51 @@ RES_SAMPLED = 'sampled'
 ROLE_PRODUCER = 'producer'
 ROLE_CONSUMER = 'consumer'
 
-_STAGES = ('VS', 'HS', 'DS', 'GS', 'PS', 'CS', 'TS', 'MS', 'All')
-
-# ResourceUsage enum-name -> READ/WRITE/RW/IGNORE access category.
-USAGE_ACCESS = {}
-for _s in _STAGES:
-    USAGE_ACCESS['%s_Constants' % _s] = READ
-    USAGE_ACCESS['%s_Resource' % _s] = READ
-    USAGE_ACCESS['%s_RWResource' % _s] = RW
-    USAGE_ACCESS['%s_ReadResource' % _s] = READ    # shader-refined: RW used read-only
-    USAGE_ACCESS['%s_WriteResource' % _s] = WRITE  # shader-refined: RW used write-only
-USAGE_ACCESS.update({
-    'VertexBuffer': READ,
-    'IndexBuffer': READ,
-    'InputTarget': READ,
-    'Indirect': READ,
-    'CopySrc': READ,
-    'ResolveSrc': READ,
-    'ColorTarget': WRITE,
-    'DepthStencilTarget': WRITE,
-    # RenderDoc reports every depth binding as write-class DepthStencilTarget;
-    # _refine_depth_access rewrites test-only bindings to these per-draw.
-    'DepthTestRead': READ,
-    'DepthTestRW': RW,
-    'Clear': WRITE,
-    'Discard': WRITE,
-    'CopyDst': WRITE,
-    'ResolveDst': WRITE,
-    'StreamOut': WRITE,
-    'Copy': RW,
-    'Resolve': RW,
-    'GenMips': RW,
-    'Barrier': IGNORE,
-    'Unused': IGNORE,
-    'CPUWrite': IGNORE,
-})
-
+# Graph node types.
+NODE_PASS = 'pass'
+NODE_RESOURCE = 'resource'
+NODE_PORTAL = 'portal'
 
 class LeafAction(object):
     """One executable action flattened out of the action tree (IR)."""
 
-    __slots__ = ('eid', 'kind', 'outputs', 'depth_out', 'marker_path',
-                 'name', 'copy_src', 'copy_dst')
+    __slots__ = ('eid', 'kind', 'group_outputs', 'group_depth', 'marker_path',
+                 'name', 'copy_src_hint', 'copy_dst_hint')
 
-    def __init__(self, eid, kind, outputs=(), depth_out=None, marker_path=(),
-                 name='', copy_src=None, copy_dst=None):
+    def __init__(self, eid, kind, group_outputs=(), group_depth=None,
+                 marker_path=(), name='', copy_src_hint=None,
+                 copy_dst_hint=None):
         self.eid = eid
         self.kind = kind  # 'draw' | 'dispatch' | 'clear' | 'transfer' | 'present'
-        self.outputs = tuple(o for o in outputs if o is not None)
-        self.depth_out = depth_out
+        # Resource hints for pass grouping/naming. Present source hints are
+        # normalised into usage_by_res during extraction.
+        self.group_outputs = tuple(o for o in group_outputs if o is not None)
+        self.group_depth = group_depth
         self.marker_path = tuple(marker_path)
         self.name = name
-        self.copy_src = copy_src
-        self.copy_dst = copy_dst
+        self.copy_src_hint = copy_src_hint
+        self.copy_dst_hint = copy_dst_hint
+
+    def draw_targets(self):
+        """Render-target set written by a draw or clear: colour outputs plus
+        the depth target."""
+        t = set(self.group_outputs)
+        if self.group_depth is not None:
+            t.add(self.group_depth)
+        return t
 
     def targets(self):
-        t = set(self.outputs)
-        if self.depth_out is not None:
-            t.add(self.depth_out)
-        if self.copy_dst is not None:
-            t.add(self.copy_dst)
+        # a clear additionally counts its copy destination as a target
+        t = self.draw_targets()
+        if self.copy_dst_hint is not None:
+            t.add(self.copy_dst_hint)
         return t
 
 
 class PassNode(object):
     def __init__(self, order, kind, name, leaves, marker_path,
                  collapsed_frame=False):
+        self.node_type = NODE_PASS
         self.id = 'p%d' % order
         self.order = order
         self.kind = kind  # 'graphics' | 'compute' | 'transfer' | 'present'
@@ -131,6 +109,8 @@ class PassNode(object):
         self.marker_path = tuple(marker_path)
         self.collapsed_frame = collapsed_frame  # double-click expands back to children
         self.drillable = False  # double-click drills into this instance
+        self.bundle_members = None
+        self.bundle_member_eids = []
 
     @property
     def frame_path(self):
@@ -139,6 +119,7 @@ class PassNode(object):
 
 class ResourceVersionNode(object):
     def __init__(self, res_key, name, version, res_kind, info, imported=False):
+        self.node_type = NODE_RESOURCE
         self.id = 'r%s_v%d' % (res_key, version)
         self.res_key = res_key
         self.name = name
@@ -156,11 +137,15 @@ class ResourceVersionNode(object):
         self.frame_path = ()  # lowest common frame of all touchers
         self.outside_readers = 0   # frame activity beyond the current scope
         self.outside_writers = 0
+        self.outside_write_eids = frozenset()
         self.scope_input = False   # written outside the scope, read inside
         self.internal = False      # content never leaves its single toucher
+        self.bundle_members = None
+        self.bundle_member_keys = []
+        self.generations = 1
 
     def label(self):
-        if getattr(self, 'version_count', self.version) >= 2:
+        if self.version_count >= 2:
             return '%s (v%d)' % (self.name, self.version)
         return self.name
 
@@ -173,33 +158,6 @@ class Edge(object):
         self.usages = []  # [(eid, usage_name)]
         # bound but never referenced by the shader at any of this edge's events
         self.unused_binding = False
-
-
-def _is_shader_usage(uname):
-    """Shader-binding usages the descriptor scan can judge; fixed-function
-    usages (attachments, copies, clears) are never 'unused'."""
-    return uname.endswith('_Resource') or uname.endswith('_RWResource')
-
-
-def apply_binding_usage(fg, results):
-    """Dash a read edge only when ALL its shader-usage events are confirmed
-    unused; any used / fixed-function / pending event keeps it solid."""
-    res_by_id = dict((n.id, n) for n in fg.resources)
-    for e in fg.edges:
-        if e.kind != READ:
-            continue
-        node = res_by_id.get(e.src_id)
-        if node is None or getattr(node, 'bundle_members', None):
-            continue
-        verdicts = []
-        for eid, uname in e.usages:
-            if not _is_shader_usage(uname):
-                verdicts = None  # fixed-function event: always "used"
-                break
-            verdicts.append(results.get((eid, node.res_key)))
-        e.unused_binding = (bool(verdicts) and
-                            all(v == 'unused' for v in verdicts))
-    return fg
 
 
 class FrameGraph(object):
@@ -219,13 +177,13 @@ class FrameGraph(object):
 
 
 def _fine_groups(leaves):
-    """Markerless grouping: consecutive draws sharing (outputs, depth_out)
+    """Markerless grouping: consecutive draws sharing group output/depth hints
     merge; consecutive dispatches merge; clears/transfers stand alone."""
     groups = []
     for act in leaves:
         key = None
         if act.kind == KIND_DRAW:
-            key = (KIND_DRAW, act.outputs, act.depth_out)
+            key = (KIND_DRAW, act.group_outputs, act.group_depth)
         elif act.kind == KIND_DISPATCH:
             key = (KIND_DISPATCH,)
         if key is not None and groups and groups[-1]['key'] == key:
@@ -301,10 +259,7 @@ def build_passes(leaves, res_names=None, marker_depth=None, collapsed=None,
     def first_draw_targets(g):
         for a in g['actions']:
             if a.kind == KIND_DRAW:
-                t = set(a.outputs)
-                if a.depth_out is not None:
-                    t.add(a.depth_out)
-                return t
+                return a.draw_targets()
         return set()
 
     # fold unnamed standalone clears into the following draw-bearing group
@@ -347,7 +302,8 @@ def build_passes(leaves, res_names=None, marker_depth=None, collapsed=None,
             if g['kind'] == KIND_PRESENT:
                 base = 'Present'
             elif g['kind'] == KIND_DRAW:
-                rt = primary.outputs[0] if primary.outputs else primary.depth_out
+                rt = (primary.group_outputs[0] if primary.group_outputs
+                      else primary.group_depth)
                 rtname = res_names.get(rt, str(rt)) if rt is not None else 'No RT'
                 base = 'Pass #%d (%s)' % (order + 1, rtname)
             elif g['kind'] == KIND_DISPATCH:
@@ -398,7 +354,7 @@ def _bucket_usages(passes, usage_by_res, boundaries=None):
     for res_key in sorted(usage_by_res.keys()):
         per_pass = {}
         for eid, uname in sorted(usage_by_res[res_key]):
-            acc = USAGE_ACCESS.get(uname, IGNORE)
+            acc = usage_access.direction(uname)
             if acc == IGNORE:
                 continue
             pi = find_pass(eid, uname)
@@ -412,6 +368,70 @@ def _bucket_usages(passes, usage_by_res, boundaries=None):
         if per_pass:
             slots[res_key] = per_pass
     return slots
+
+
+def _stamp_version_counts(fg, version_count):
+    """Stamp each resource node with its res_key's total write-version count,
+    which drives the #n badge / (vN) label."""
+    for node in fg.resources:
+        node.version_count = version_count.get(node.res_key, node.version)
+
+
+def _detect_orphans(fg):
+    """Flag passes with no candidate-resource I/O (the UI hides them) and give
+    each a rank hint after the nearest preceding non-orphan so it stays placed
+    when shown."""
+    incident = set()
+    for e in fg.edges:
+        incident.add(e.src_id)
+        incident.add(e.dst_id)
+    fg.orphan_pass_ids = set(p.id for p in fg.passes if p.id not in incident)
+    last_toucher = None
+    for p in fg.passes:
+        if p.id in fg.orphan_pass_ids:
+            if last_toucher is not None:
+                fg.rank_edges.append(Edge(last_toucher.id, p.id, EDGE_RANK))
+        else:
+            last_toucher = p
+
+
+def _assign_frame_paths(fg):
+    """Record every nested frame path and set each resource's lowest common
+    frame: the deepest marker path shared by all of its touchers."""
+    for p in fg.passes:
+        mp = p.marker_path
+        for level in range(1, len(mp)):
+            fg.frame_paths.add(mp[:level])
+    pass_mp = dict((p.id, p.marker_path) for p in fg.passes)
+    for node in fg.resources:
+        touchers = set(node.writer_ids) | set(node.reader_ids)
+        mps = [pass_mp[t] for t in touchers if t in pass_mp]
+        if not mps:
+            node.frame_path = ()
+            continue
+        common = mps[0]
+        for mp in mps[1:]:
+            limit = min(len(common), len(mp))
+            i = 0
+            while i < limit and common[i] == mp[i]:
+                i += 1
+            common = common[:i]
+        while common and common not in fg.frame_paths:
+            common = common[:-1]
+        node.frame_path = tuple(common)
+
+
+def _classify_internal(fg, folded_self_rw):
+    """Mark resources that never leave their single toucher: a pure self-read-
+    write of a private working set (the read may have been folded away, hence
+    folded_self_rw). Write-only is NOT internal -- produced-but-unread content
+    stays visible so the user can judge readback-vs-bug (this also exposes a
+    present-less swapchain)."""
+    for node in fg.resources:
+        touchers = set(node.writer_ids) | set(node.reader_ids)
+        self_rw = bool(node.reader_ids) or node.res_key in folded_self_rw
+        node.internal = (bool(node.writer_ids) and self_rw and
+                         len(touchers) == 1)
 
 
 def build_graph(passes, usage_by_res, res_info, res_names=None, versioned=False,
@@ -491,6 +511,9 @@ def build_graph(passes, usage_by_res, res_info, res_names=None, versioned=False,
                 has_w = len(slot['w']) > 0
                 if has_r:
                     if cur is None:
+                        # first touch is a read: no producing write inside this
+                        # view, so it is imported (mirror of the merged branch's
+                        # `imported = first_writer_pi is None`)
                         cur = new_version(res_key, imported=True)
                     add_edge(cur.id, p.id, READ, slot['r'])
                     cur.reader_ids.append(p.id)
@@ -518,6 +541,8 @@ def build_graph(passes, usage_by_res, res_info, res_names=None, versioned=False,
                 if per_pass[pi]['w']:
                     first_writer_pi = pi
                     break
+            # imported == no producing write inside this view (mirror of the
+            # versioned branch's first-touch-is-a-read case)
             node = new_version(res_key, imported=first_writer_pi is None)
             for pi in order_sorted:
                 slot = per_pass[pi]
@@ -543,79 +568,13 @@ def build_graph(passes, usage_by_res, res_info, res_names=None, versioned=False,
                     Edge(fg.passes[a].id, fg.passes[b].id, EDGE_RANK))
             latest[res_key] = node
 
-    # GetUsage reports nothing for present events; link backbuffer via copySource.
-    for p in fg.passes:
-        if p.kind != CAT_PRESENT:
-            continue
-        for leaf in p.leaves:
-            src = leaf.copy_src
-            if src is None or src not in res_info:
-                continue
-            node = latest.get(src)
-            if node is None:
-                node = new_version(src, imported=True)
-                latest[src] = node
-            add_edge(node.id, p.id, READ, [(leaf.eid, 'Present')])
-            if p.id not in node.reader_ids:
-                node.reader_ids.append(p.id)
-            if not versioned:
-                fg.rank_edges.append(Edge(node.id, p.id, EDGE_RANK))
-
     if versioned:
         fg.rank_edges = list(fg.edges)  # versioned construction is already a DAG
 
-    # Stamp each node with its res_key's total write-version count (UI badge).
-    for node in fg.resources:
-        node.version_count = version_count.get(node.res_key, node.version)
-
-    # Orphan passes (no candidate-resource I/O): UI hides them; rank hint after
-    # the nearest preceding non-orphan keeps them placed when shown.
-    incident = set()
-    for e in fg.edges:
-        incident.add(e.src_id)
-        incident.add(e.dst_id)
-    fg.orphan_pass_ids = set(p.id for p in fg.passes if p.id not in incident)
-    last_toucher = None
-    for p in fg.passes:
-        if p.id in fg.orphan_pass_ids:
-            if last_toucher is not None:
-                fg.rank_edges.append(Edge(last_toucher.id, p.id, EDGE_RANK))
-        else:
-            last_toucher = p
-
-    # ---- nested frames: frame paths + each resource's lowest common frame
-    for p in fg.passes:
-        mp = p.marker_path
-        for level in range(1, len(mp)):
-            fg.frame_paths.add(mp[:level])
-    pass_mp = dict((p.id, p.marker_path) for p in fg.passes)
-    for node in fg.resources:
-        touchers = set(node.writer_ids) | set(node.reader_ids)
-        mps = [pass_mp[t] for t in touchers if t in pass_mp]
-        if not mps:
-            node.frame_path = ()
-            continue
-        common = mps[0]
-        for mp in mps[1:]:
-            limit = min(len(common), len(mp))
-            i = 0
-            while i < limit and common[i] == mp[i]:
-                i += 1
-            common = common[:i]
-        while common and common not in fg.frame_paths:
-            common = common[:-1]
-        node.frame_path = tuple(common)
-
-    # internal = pure self-read-write (one toucher both reads and writes a
-    # private working set; the read may have been folded, hence folded_self_rw).
-    # Write-only is NOT internal: produced-but-unread content stays visible so
-    # the user can judge readback-vs-bug (also exposes a present-less swapchain).
-    for node in fg.resources:
-        touchers = set(node.writer_ids) | set(node.reader_ids)
-        self_rw = (bool(node.reader_ids) or
-                   node.res_key in folded_self_rw)
-        node.internal = (bool(node.writer_ids) and self_rw and
-                         len(touchers) == 1)
+    _stamp_version_counts(fg, version_count)
+    _detect_orphans(fg)
+    _assign_frame_paths(fg)
+    _classify_internal(fg, folded_self_rw)
     return fg
 
 
@@ -623,7 +582,7 @@ def build_graph(passes, usage_by_res, res_info, res_names=None, versioned=False,
 # Everything below touches renderdoc (imported lazily) and runs on the
 # replay thread only.
 
-def _collect_leaves(rd, roots, sdfile, key_of):
+def _collect_leaves(rd, roots, sdfile, key_of, present_resolver=None):
     """Flatten the action tree into LeafAction IR. Recurse into PushMarker
     regions and grouping nodes; MultiAction stays a single leaf. Only semantic
     debug markers contribute to marker_path - API-structure groupings
@@ -632,20 +591,16 @@ def _collect_leaves(rd, roots, sdfile, key_of):
 
     Returns (leaves, boundaries).
     """
-    def flag(name):
-        return getattr(rd.ActionFlags, name, 0)
-
-    f_draw = flag('Drawcall') | flag('MeshDispatch')
-    f_dispatch = flag('Dispatch') | flag('DispatchRay')
-    f_clear = flag('Clear')
-    f_transfer = flag('Copy') | flag('Resolve') | flag('GenMips')
-    f_present = flag('Present')
-    f_push = flag('PushMarker')
-    f_multi = flag('MultiAction')
-    f_beginpass = flag('BeginPass')
-    f_endpass = flag('EndPass')
-    f_structural = (flag('CmdList') | flag('PassBoundary') | flag('BeginPass') |
-                    flag('EndPass') | flag('CommandBufferBoundary'))
+    f_draw = action_flags.draw(rd)
+    f_dispatch = action_flags.dispatch(rd)
+    f_clear = action_flags.flag(rd, 'Clear')
+    f_transfer = action_flags.transfer(rd)
+    f_present = action_flags.flag(rd, 'Present')
+    f_push = action_flags.flag(rd, 'PushMarker')
+    f_multi = action_flags.flag(rd, 'MultiAction')
+    f_beginpass = action_flags.flag(rd, 'BeginPass')
+    f_endpass = action_flags.flag(rd, 'EndPass')
+    f_structural = action_flags.structural(rd)
 
     leaves = []
     boundaries = {}
@@ -709,14 +664,20 @@ def _collect_leaves(rd, roots, sdfile, key_of):
         if kind == KIND_PRESENT and copy_src is None:
             # Some APIs expose the presented backbuffer as copyDestination.
             copy_src = key_of(act.copyDestination)
+        if (kind == KIND_PRESENT and copy_src is None and
+                present_resolver is not None):
+            try:
+                copy_src = present_resolver.resolve(act)
+            except Exception:
+                copy_src = None
         leaves.append(LeafAction(
             act.eventId, kind,
-            outputs=outs,
-            depth_out=key_of(act.depthOut),
+            group_outputs=outs,
+            group_depth=key_of(act.depthOut),
             marker_path=path,
             name=action_name(act),
-            copy_src=copy_src,
-            copy_dst=key_of(act.copyDestination)))
+            copy_src_hint=copy_src,
+            copy_dst_hint=key_of(act.copyDestination)))
 
     for a in roots:
         visit(a, ())
@@ -727,34 +688,20 @@ def texture_kind_of(cf, texcat, cands=None):
     """Candidate gate + node-kind for a texture's creationFlags; None when the
     config excludes it. texcat=rd.TextureCategory (param'd for testing).
 
-    Admission ORs enabled class masks; 'tex_other' admits textures with none of
-    the four classic flags (sampled/staging) without re-admitting a turned-off
-    class. Classification is gate-independent (priority swap > depth > color > rw)."""
+    Classification and admission use the same priority order. A texture that
+    is classified as swapchain is controlled only by the swapchain switch, even
+    if RenderDoc also marks it as a color target."""
     if cands is None:
-        cands = _config.DEFAULTS
-    mask = 0
-    if cands.get(_config.KEY_TEX_COLOR):
-        mask |= texcat.ColorTarget
-    if cands.get(_config.KEY_TEX_DEPTH):
-        mask |= texcat.DepthTarget
-    if cands.get(_config.KEY_TEX_RW):
-        mask |= texcat.ShaderReadWrite
-    if cands.get(_config.KEY_TEX_SWAP):
-        mask |= texcat.SwapBuffer
-    classic = (texcat.ColorTarget | texcat.DepthTarget |
-               texcat.ShaderReadWrite | texcat.SwapBuffer)
-    if not (cf & mask) and not (cands.get(_config.KEY_TEX_OTHER) and
-                                not (cf & classic)):
-        return None
+        cands = _config.candidates_of(_config.DEFAULTS)
     if cf & texcat.SwapBuffer:
-        return RES_SWAPCHAIN
+        return RES_SWAPCHAIN if cands.get(_config.KEY_TEX_SWAP) else None
     if cf & texcat.DepthTarget:
-        return RES_DEPTH
+        return RES_DEPTH if cands.get(_config.KEY_TEX_DEPTH) else None
     if cf & texcat.ColorTarget:
-        return RES_COLOR
+        return RES_COLOR if cands.get(_config.KEY_TEX_COLOR) else None
     if cf & texcat.ShaderReadWrite:
-        return RES_UAV_TEX
-    return RES_SAMPLED
+        return RES_UAV_TEX if cands.get(_config.KEY_TEX_RW) else None
+    return RES_SAMPLED if cands.get(_config.KEY_TEX_OTHER) else None
 
 
 def buffer_admitted(cf, bufcat, cands=None):
@@ -762,7 +709,7 @@ def buffer_admitted(cf, bufcat, cands=None):
     'buf_noflags' admits creationFlags==0 buffers (copy dst / readback staging,
     invisible to every category mask)."""
     if cands is None:
-        cands = _config.DEFAULTS
+        cands = _config.candidates_of(_config.DEFAULTS)
     if cands.get(_config.KEY_BUF_NOFLAGS) and not cf:
         return True
     mask = 0
@@ -777,498 +724,84 @@ def buffer_admitted(cf, bufcat, cands=None):
     return bool(cf & mask)
 
 
-# Vulkan enum values (stable per the VK spec)
-_VK_COMPARE_OP_ALWAYS = 7
-_VK_STENCIL_OP_KEEP = 0
-_VK_BIND_POINT_GRAPHICS = 0
-
-def _label_flag_masks(rd):
-    """(marker_mask, exclude_mask) for API-agnostic debug-label detection: an
-    action whose flags are PURELY marker-class executes nothing, so any usage
-    on it is a phantom. exclude keeps structural/executing actions (which can
-    also carry PopMarker) out of the label set."""
-    def fl(name):
-        return getattr(rd.ActionFlags, name, 0)
-    marker = fl('PushMarker') | fl('PopMarker') | fl('SetMarker')
-    exclude = (fl('CmdList') | fl('PassBoundary') | fl('BeginPass') |
-               fl('EndPass') | fl('CommandBufferBoundary') |
-               fl('MultiAction') | fl('Drawcall') | fl('Dispatch') |
-               fl('MeshDispatch') | fl('DispatchRay') | fl('Clear') |
-               fl('Copy') | fl('Resolve') | fl('GenMips') |
-               fl('Present'))
-    return marker, exclude
+def _make_present_resolver(controller, chunks):
+    if not chunks:
+        return None
+    try:
+        resolver_cls = apis.present_resolver(apis.api_key(controller))
+        if resolver_cls is None:
+            return None
+        return resolver_cls(chunks)
+    except Exception:
+        return None
 
 
-def _last_resource_id(ch):
-    """Output-parameter lookup: outputs serialise after inputs, so the LAST
-    non-null resource-id child is the created/bound object."""
-    rid = None
-    for i in range(ch.NumChildren()):
-        try:
-            r = ch.GetChild(i).AsResourceId()
-        except Exception:
+def _add_present_usages(usage_by_res, leaves, res_info):
+    """RenderDoc does not report Present as ResourceUsage. Convert the extracted
+    Present source hint into a normal read usage so graph building, scoped views
+    and portals all use the same path."""
+    for leaf in leaves:
+        if leaf.kind != KIND_PRESENT or leaf.copy_src_hint is None:
             continue
-        s = _rid_str(r)
-        if s is not None:
-            rid = s
-    return rid
+        res_key = leaf.copy_src_hint
+        if res_key not in res_info:
+            continue
+        usage_by_res.setdefault(res_key, []).append((leaf.eid, 'Present'))
 
 
-def _chunk_is(name, tail):
-    """Chunk-name family match: bare name or namespaced '...::tail' (the depth
-    adapters recognise chunk families regardless of API prefix)."""
-    return name == tail or name.endswith('::' + tail)
+def _apply_usage_cleanup(usage_by_res, result):
+    usage_cleanup.apply_label_cleanup(usage_by_res, result)
 
 
-def _pipeline_depth_access(dss):
-    """Classify one VkPipelineDepthStencilStateCreateInfo into read/write/rw/none.
-    A test with compareOp != ALWAYS samples the buffer, hence 'read'."""
-    if dss is None or dss.NumChildren() == 0:
-        return ACCESS_NONE   # NULL state: no depth attachment
-    reads = False
-    writes = False
-    if _child_int(dss, 'depthTestEnable'):
-        if _child_int(dss, 'depthCompareOp') != _VK_COMPARE_OP_ALWAYS:
-            reads = True
-        if _child_int(dss, 'depthWriteEnable'):
-            writes = True
-    if _child_int(dss, 'stencilTestEnable'):
-        for fname in ('front', 'back'):
-            f = dss.FindChild(fname)
-            if f is None:
-                continue
-            if _child_int(f, 'compareOp') != _VK_COMPARE_OP_ALWAYS:
-                reads = True
-            wm = _child_int(f, 'writeMask')
-            ops = (_child_int(f, 'failOp'), _child_int(f, 'passOp'),
-                   _child_int(f, 'depthFailOp'))
-            if wm and any(o != _VK_STENCIL_OP_KEEP for o in ops):
-                writes = True
-    if writes:
-        return RW if reads else WRITE
-    return READ if reads else ACCESS_NONE
+def _apply_depth_refinement(usage_by_res, result):
+    result = result or {}
+    usage_access.apply_depth_access(usage_by_res, result.get('access') or {})
 
 
-# ---- per-API depth-state adapters ------------------------------------ #
-# Only "where the baked depth/stencil state lives" is per-API (abstract
-# PipeState exposes none). ONLY VULKAN AND D3D12 ARE VALIDATED; D3D11/GL
-# follow RenderDoc serialisation conventions, parse defensively, and a
-# creation family that yields nothing raises a VISIBLE warning rather than
-# silently refining nothing.
-
-_D3D_COMPARISON_ALWAYS = 8     # D3D11/12_COMPARISON_FUNC_ALWAYS
-_D3D_STENCIL_OP_KEEP = 1       # D3D11/12_STENCIL_OP_KEEP
-_GL_DEPTH_TEST = 0x0B71
-_GL_STENCIL_TEST = 0x0B90
-_GL_ALWAYS = 0x0207
-_GL_LESS = 0x0201
-_GL_KEEP = 0x1E00
+def _apply_shader_refinement(usage_by_res, result):
+    usage_access.apply_shader_access(usage_by_res, result or {})
 
 
-def _d3d_depth_access(dss):
-    """Classify a D3D depth/stencil desc into read/write/rw/none. D3D11,
-    classic D3D12 and stream-PSO DESC2 share field names; only the stencil
-    write mask differs (DESC2 per-face vs classic top-level), handled by the
-    per-face fallback below."""
-    if dss is None:
-        return None            # unknown: keep legacy WRITE
-    reads = False
-    writes = False
-    if _child_int(dss, 'DepthEnable'):
-        if _child_int(dss, 'DepthFunc') != _D3D_COMPARISON_ALWAYS:
-            reads = True
-        if _child_int(dss, 'DepthWriteMask'):   # ZERO=0 / ALL=1
-            writes = True
-    if _child_int(dss, 'StencilEnable'):
-        top_wm = _child_int(dss, 'StencilWriteMask')   # classic / D3D11
-        for fname in ('FrontFace', 'BackFace'):
-            f = dss.FindChild(fname)
-            if f is None:
-                continue
-            if _child_int(f, 'StencilFunc') != _D3D_COMPARISON_ALWAYS:
-                reads = True
-            wm = _child_int(f, 'StencilWriteMask', top_wm)   # DESC2: per-face
-            ops = (_child_int(f, 'StencilFailOp', _D3D_STENCIL_OP_KEEP),
-                   _child_int(f, 'StencilDepthFailOp',
-                              _D3D_STENCIL_OP_KEEP),
-                   _child_int(f, 'StencilPassOp', _D3D_STENCIL_OP_KEEP))
-            if wm and any(o != _D3D_STENCIL_OP_KEEP for o in ops):
-                writes = True
-    if writes:
-        return RW if reads else WRITE
-    return READ if reads else ACCESS_NONE
+def _usage_refinements(controller, rd, usage_by_res, leaves,
+                       refinement_cache, parse_shaders, progress, warnings):
+    """Return [(bundle_key, result, apply_fn), ...] for usage refinement."""
+    refinement_cache = refinement_cache or {}
+    cleanup_result = usage_cleanup.collect_label_cleanup(controller, rd)
+    depth_result = depth_access.refine(
+        controller, rd, usage_by_res, leaves,
+        cached=refinement_cache.get('depth_access'),
+        progress=progress, warnings=warnings)
+    shader_result = (shader_refinement.refine(controller, rd, warnings=warnings)
+                     if parse_shaders else {})
+    return [
+        ('usage_cleanup', cleanup_result, _apply_usage_cleanup),
+        ('depth_access', depth_result, _apply_depth_refinement),
+        ('shader_access', shader_result, _apply_shader_refinement),
+    ]
 
 
-class _VkDepthAdapter(object):
-    """Validated against a real Vulkan capture."""
-
-    @staticmethod
-    def build_tables(chunks):
-        tables = {}
-        seen = 0
-        for c in chunks:
-            if c.name != 'vkCreateGraphicsPipelines':
-                continue
-            seen += 1
-            try:
-                pid = str(c.FindChild('Pipeline').AsResourceId())
-                info = c.FindChild('CreateInfo')
-                dss = (info.FindChild('pDepthStencilState')
-                       if info is not None else None)
-                tables[pid] = _pipeline_depth_access(dss)
-            except Exception:
-                continue
-        return tables, seen
-
-    @staticmethod
-    def on_chunk(ch, state, tables):
-        if ch.name != 'vkCmdBindPipeline':
-            return
-        try:
-            if (ch.FindChild('pipelineBindPoint').AsInt() ==
-                    _VK_BIND_POINT_GRAPHICS):
-                state['cur'] = str(
-                    ch.FindChild('pipeline').AsResourceId())
-        except Exception:
-            pass
-
-    @staticmethod
-    def current(state, tables):
-        return tables.get(state.get('cur'))
+def _apply_usage_refinements(usage_by_res, refinements):
+    for _key, result, apply_fn in refinements:
+        apply_fn(usage_by_res, result)
 
 
-class _D3D12DepthAdapter(object):
-    """Parses the graphics-PSO depth-stencil state. RenderDoc names the chunk
-    'CreateGraphicsPipeline' for a classic CreateGraphicsPipelineState call,
-    'CreatePipelineState' for a stream-style one (modern RHIs / UE5 emit the
-    latter); pDesc.DepthStencilState carries the same field names either way."""
-
-    @staticmethod
-    def build_tables(chunks):
-        tables = {}
-        seen = 0
-        for c in chunks:
-            if not (_chunk_is(c.name, 'CreateGraphicsPipeline')
-                    or _chunk_is(c.name, 'CreateGraphicsPipelineState')
-                    or _chunk_is(c.name, 'CreatePipelineState')):
-                continue
-            seen += 1
-            try:
-                desc = c.FindChild('pDesc')
-                dss = (desc.FindChild('DepthStencilState')
-                       if desc is not None else None)
-                pid = None
-                for nm in ('pPipelineState', 'pPipeline',
-                           'PipelineState'):
-                    n = c.FindChild(nm)
-                    if n is not None:
-                        pid = str(n.AsResourceId())
-                        break
-                if pid is None:
-                    pid = _last_resource_id(c)
-                acc = _d3d_depth_access(dss)
-                if pid and acc is not None:
-                    tables[pid] = acc
-            except Exception:
-                continue
-        return tables, seen
-
-    @staticmethod
-    def on_chunk(ch, state, tables):
-        if not _chunk_is(ch.name, 'SetPipelineState'):
-            return
-        try:
-            n = ch.FindChild('pPipelineState')
-            state['cur'] = (str(n.AsResourceId()) if n is not None
-                            else _last_resource_id(ch))
-        except Exception:
-            pass
-
-    @staticmethod
-    def current(state, tables):
-        return tables.get(state.get('cur'))
-
-
-class _D3D11DepthAdapter(object):
-    """UNVALIDATED. Depth state is a context-bound object; unbound/NULL means
-    the API default (test on, write all, func LESS = read-write)."""
-
-    _DEFAULT = RW
-
-    @staticmethod
-    def build_tables(chunks):
-        tables = {}
-        seen = 0
-        for c in chunks:
-            if not _chunk_is(c.name, 'CreateDepthStencilState'):
-                continue
-            seen += 1
-            try:
-                desc = c.FindChild('pDepthStencilDesc')
-                if desc is None:   # fall back: child carrying the desc fields
-                    for i in range(c.NumChildren()):
-                        k = c.GetChild(i)
-                        if k.FindChild('DepthEnable') is not None:
-                            desc = k
-                            break
-                out = c.FindChild('ppDepthStencilState')
-                pid = (str(out.AsResourceId()) if out is not None
-                       else _last_resource_id(c))
-                acc = _d3d_depth_access(desc)
-                if pid and acc is not None:
-                    tables[pid] = acc
-            except Exception:
-                continue
-        return tables, seen
-
-    @staticmethod
-    def on_chunk(ch, state, tables):
-        if not _chunk_is(ch.name, 'OMSetDepthStencilState'):
-            return
-        try:
-            n = ch.FindChild('pDepthStencilState')
-            pid = (str(n.AsResourceId()) if n is not None
-                   else _last_resource_id(ch))
-            state['cur'] = _rid_str(pid)
-        except Exception:
-            pass
-
-    @staticmethod
-    def current(state, tables):
-        pid = state.get('cur')
-        if pid is None:
-            return _D3D11DepthAdapter._DEFAULT
-        return tables.get(pid)   # unknown object: legacy WRITE
-
-
-class _GLDepthAdapter(object):
-    """UNVALIDATED. GL has no state objects - discrete calls mutate the
-    context; *Separate stencil variants are coarsened (last call wins)."""
-
-    @staticmethod
-    def build_tables(chunks):
-        return {}, 0    # nothing to create; never reports parse failure
-
-    @staticmethod
-    def on_chunk(ch, state, tables):
-        name = ch.name
-        if name in ('glEnable', 'glDisable'):
-            cap = _child_int(ch, 'cap', -1)
-            on = (name == 'glEnable')
-            if cap == _GL_DEPTH_TEST:
-                state['dtest'] = on
-            elif cap == _GL_STENCIL_TEST:
-                state['stest'] = on
-        elif name == 'glDepthMask':
-            state['dwrite'] = bool(_child_int(ch, 'flag', 1))
-        elif name == 'glDepthFunc':
-            state['dfunc'] = _child_int(ch, 'func', _GL_LESS)
-        elif name in ('glStencilOp', 'glStencilOpSeparate'):
-            ops = (_child_int(ch, 'sfail', _GL_KEEP),
-                   _child_int(ch, 'dpfail', _GL_KEEP),
-                   _child_int(ch, 'dppass', _GL_KEEP))
-            state['sop_write'] = any(o != _GL_KEEP for o in ops)
-        elif name in ('glStencilFunc', 'glStencilFuncSeparate'):
-            state['sfunc'] = _child_int(ch, 'func', _GL_ALWAYS)
-        elif name in ('glStencilMask', 'glStencilMaskSeparate'):
-            state['smask'] = _child_int(ch, 'mask', 0xFF)
-
-    @staticmethod
-    def current(state, tables):
-        reads = False
-        writes = False
-        if state.get('dtest', False):     # GL default: test disabled
-            if state.get('dfunc', _GL_LESS) != _GL_ALWAYS:
-                reads = True
-            if state.get('dwrite', True):
-                writes = True
-        if state.get('stest', False):
-            if state.get('sfunc', _GL_ALWAYS) != _GL_ALWAYS:
-                reads = True
-            if state.get('smask', 0xFF) and state.get('sop_write',
-                                                      False):
-                writes = True
-        if writes:
-            return RW if reads else WRITE
-        return READ if reads else ACCESS_NONE
-
-
-_DEPTH_ADAPTERS = {
-    'vulkan': _VkDepthAdapter,
-    'd3d12': _D3D12DepthAdapter,
-    'd3d11': _D3D11DepthAdapter,
-    'opengl': _GLDepthAdapter,
-}
-
-
-def _refine_depth_access(controller, rd, usage_by_res, leaf_eids,
-                         progress=None, warnings=None):
-    """Classify each depth-attachment binding from the bound pipeline's BAKED
-    state, read statically from structured data - ZERO replay round-trips (the
-    old SetFrameEvent walk cost ~86ms/event, ~55s/capture). Build a
-    {pipeline: access} table, then walk the action tree in event order tracking
-    the current pipeline so each depth-bound draw inherits its access.
-
-    Only executable leaves are classified; boundary events (store/resolve) keep
-    legacy WRITE. Dynamic depth state is not rewritten (draws fall back to baked
-    state). Dispatches through the per-API adapter registry; unknown APIs skip.
-
-    Returns (access, label_eids): access = {eid: read|write|rw|none}, missing =
-    legacy WRITE; label_eids = debug-label events whose phantom attachment
-    usages the caller strips."""
-    try:
-        roots = controller.GetRootActions()
-    except Exception:
-        return {}, set()
-    f_marker, f_not_label = _label_flag_masks(rd)
-
-    adapter = None
-    chunks = None
-    api_key = ''
-    try:
-        api_key = str(controller.GetAPIProperties()
-                      .pipelineType).split('.')[-1].lower()
-        adapter = _DEPTH_ADAPTERS.get(api_key)
-        if adapter is not None:
-            chunks = controller.GetStructuredFile().chunks
-    except Exception:
-        adapter = None
-
-    targets = set()
-    if adapter is not None:
-        for evs in usage_by_res.values():
-            for (eid, uname) in evs:
-                if uname == 'DepthStencilTarget' and eid in leaf_eids:
-                    targets.add(eid)
-    if progress is not None:
-        progress(0, len(targets))
-
-    tables = {}
-    if adapter is not None:
-        try:
-            tables, seen_create = adapter.build_tables(chunks)
-        except Exception:
-            tables, seen_create = {}, 0
-        if seen_create and not tables:
-            # chunk family exists but nothing parsed (unexpected layout): warn
-            # rather than silently refine nothing
-            if warnings is not None:
-                warnings.append(
-                    'depth refinement: %s pipeline parsing failed '
-                    '(unvalidated adapter) - depth bindings keep '
-                    'write semantics' % api_key)
-            adapter = None
-
-    access = {}
-    label_eids = set()
-    state = {}
-
-    def visit(acts):
-        for a in acts:
-            if (a.flags & f_marker) and not (a.flags & f_not_label):
-                label_eids.add(a.eventId)
-            if adapter is not None:
-                for ev in a.events:
-                    try:
-                        ch = chunks[ev.chunkIndex]
-                    except Exception:
-                        continue
-                    adapter.on_chunk(ch, state, tables)
-                if a.eventId in targets:
-                    acc = adapter.current(state, tables)
-                    if acc is not None:
-                        access[a.eventId] = acc
-            visit(a.children)
-
-    visit(roots)
-    if progress is not None:
-        progress(len(targets), len(targets))
-    return access, label_eids
-
-
-def _strip_label_usages(usage_by_res, label_eids):
-    """Drop usages on debug-label events: they execute nothing, so the
-    attachment usages RenderDoc tags on them are phantoms that would forge a
-    writer for a pass that never touched the resource."""
-    if not label_eids:
-        return
-    for res_key, evs in usage_by_res.items():
-        out = [(eid, uname) for (eid, uname) in evs
-               if eid not in label_eids]
-        if len(out) != len(evs):
-            usage_by_res[res_key] = out
-
-
-DROP = object()   # rename-table sentinel: delete the event entirely
-
-
-def _apply_access_rename(usage_by_res, lookup, usage_filter, rename):
-    """Rewrite usage names in place from an access verdict. lookup(eid, res_key)
-    -> access (None leaves the event alone); usage_filter(uname) picks usages to
-    consider; rename maps access -> new uname (str or callable(old)->new), or
-    DROP to delete the event. Shared by depth and shader-access refinement."""
-    for res_key, evs in list(usage_by_res.items()):
-        out = []
-        changed = False
-        for (eid, uname) in evs:
-            if usage_filter(uname):
-                a = lookup(eid, res_key)
-                repl = rename.get(a) if a is not None else None
-                if repl is DROP:
-                    changed = True
-                    continue
-                if repl is not None:
-                    uname = repl(uname) if callable(repl) else repl
-                    changed = True
-            out.append((eid, uname))
-        if changed:
-            usage_by_res[res_key] = out
-
-
-def _apply_depth_access(usage_by_res, access):
-    """RenderDoc reports every depth binding as write-class DepthStencilTarget;
-    rewrite test-only / test+write bindings per draw, drop no-attachment draws."""
-    if not access:
-        return
-    _apply_access_rename(
-        usage_by_res,
-        lookup=lambda eid, rk: access.get(eid),
-        usage_filter=lambda u: u == 'DepthStencilTarget',
-        rename={READ: 'DepthTestRead', RW: 'DepthTestRW', ACCESS_NONE: DROP})
-
-
-def _apply_shader_access(usage_by_res, shader_access):
-    """Refine *_RWResource per (eid, res_key) from shader parsing: read-only and
-    write-only get renamed so _bucket_usages drops the spurious edge; rw / unused
-    stay as RWResource (rw keeps both edges; unused stays solid here and is dashed
-    separately by apply_binding_usage)."""
-    if not shader_access:
-        return
-
-    def to_read(u):
-        return u[:-len('RWResource')] + 'ReadResource'
-
-    def to_write(u):
-        return u[:-len('RWResource')] + 'WriteResource'
-
-    _apply_access_rename(
-        usage_by_res,
-        lookup=lambda eid, rk: shader_access.get((eid, rk)),
-        usage_filter=lambda u: u.endswith('_RWResource'),
-        rename={READ: to_read, WRITE: to_write})
+def _refinement_bundle_values(refinements):
+    return dict((key, result) for key, result, _apply_fn in refinements)
 
 
 def extract_bundle(controller, include_buffers=True, candidates=None,
-                   depth_access=None, progress=None):
+                   refinement_cache=None, progress=None, parse_shaders=False):
     """Pull actions + per-resource usage into a plain-Python bundle. Replay
     thread only. The graph is built from the bundle on the UI side so
     marker-depth/versioning toggles re-render without another replay.
 
     candidates: config.candidates_of()-shaped dict gating which resources enter
     (None = defaults). include_buffers gates the buffer pass as a whole.
-    depth_access: cached {'access', 'labels'} from a prior extraction of the
-    SAME capture (eids are stable) to skip the structured-data walk; None =
-    walk and return it. progress(done, total) reports the walk."""
+    refinement_cache: cached refinement payloads from a prior extraction of
+    the SAME capture (eids are stable). progress(done, total) reports the
+    depth walk when it runs.
+    parse_shaders: run the same extraction-stage static shader-access pass and
+    bake its read/write de-edging into usage_by_res."""
     import renderdoc as rd
 
     t0 = time.time()
@@ -1324,7 +857,6 @@ def extract_bundle(controller, include_buffers=True, candidates=None,
             }}
             rid_objects[k] = buf.resourceId
 
-
     usage_name_of = {}
     for uname in USAGE_ACCESS:
         val = getattr(rd.ResourceUsage, uname, None)
@@ -1347,18 +879,18 @@ def extract_bundle(controller, include_buffers=True, candidates=None,
             usage_by_res[k] = lst
 
     sdfile = controller.GetStructuredFile()
+    chunks = getattr(sdfile, 'chunks', ())
+    present_resolver = _make_present_resolver(controller, chunks)
     leaves, pass_boundaries = _collect_leaves(
-        rd, controller.GetRootActions(), sdfile, key_of)
+        rd, controller.GetRootActions(), sdfile, key_of,
+        present_resolver=present_resolver)
+    _add_present_usages(usage_by_res, leaves, res_info)
 
-    if depth_access is None:
-        leaf_eids = set(l.eid for l in leaves)
-        access, labels = _refine_depth_access(
-            controller, rd, usage_by_res, leaf_eids, progress=progress,
-            warnings=warnings)
-        depth_access = {'access': access, 'labels': sorted(labels)}
-    _apply_depth_access(usage_by_res, depth_access.get('access') or {})
-    _strip_label_usages(usage_by_res,
-                        frozenset(depth_access.get('labels') or ()))
+    refinements = _usage_refinements(
+        controller, rd, usage_by_res, leaves, refinement_cache, parse_shaders,
+        progress, warnings)
+    _apply_usage_refinements(usage_by_res, refinements)
+    refinement_values = _refinement_bundle_values(refinements)
 
     return {
         'leaves': leaves,
@@ -1367,13 +899,34 @@ def extract_bundle(controller, include_buffers=True, candidates=None,
         'res_info': res_info,
         'res_names': res_names,
         'rid_objects': rid_objects,
-        'depth_access': depth_access,
+        'refinements': refinement_values,
+        'refinement_cache': {
+            'depth_access': refinement_values['depth_access'],
+        },
         'warnings': warnings,
         'seconds': time.time() - t0,
     }
 
 
 LARGE_FRAME_PASS_WARN = 2000   # pass-node count above which the UI warns
+
+
+def _finalize_from_bundle(fg, bundle):
+    """Attach bundle-level metadata to a freshly built graph: warnings,
+    resource-id objects, unused-binding flags from shader-access refinement,
+    and the summary stats."""
+    fg.warnings = list(bundle['warnings']) + fg.warnings
+    fg.rid_objects = bundle['rid_objects']
+    refinements = bundle.get('refinements') or {}
+    usage_access.apply_unused_binding_flags(
+        fg, refinements.get('shader_access') or {})
+    fg.stats = {
+        'passes': len(fg.passes),
+        'resources': len(fg.resources),
+        'edges': len(fg.edges),
+        'seconds': bundle['seconds'],
+    }
+    return fg
 
 
 def build_from_bundle(bundle, marker_depth=None, versioned=False,
@@ -1384,14 +937,7 @@ def build_from_bundle(bundle, marker_depth=None, versioned=False,
     fg = build_graph(passes, bundle['usage_by_res'], bundle['res_info'],
                      bundle['res_names'], versioned=versioned,
                      boundaries=bundle.get('pass_boundaries'))
-    fg.warnings = list(bundle['warnings']) + fg.warnings
-    fg.rid_objects = bundle['rid_objects']
-    fg.stats = {
-        'passes': len(fg.passes),
-        'resources': len(fg.resources),
-        'edges': len(fg.edges),
-        'seconds': bundle['seconds'],
-    }
+    _finalize_from_bundle(fg, bundle)
     if len(fg.passes) > LARGE_FRAME_PASS_WARN:
         fg.warnings.append('Very large frame (%d pass nodes); consider '
                            'disabling buffers or using the filter.' % len(fg.passes))
@@ -1410,6 +956,7 @@ class PortalNode(object):
     portal_path/portal_range."""
 
     def __init__(self, idx, path, rng, role, name=None, focus_eid=None):
+        self.node_type = NODE_PORTAL
         self.id = 'portal%d' % idx
         self.order = PORTAL_ORDER_BASE + idx  # sorts after every real pass
         self.kind = CAT_PORTAL
@@ -1428,6 +975,8 @@ class PortalNode(object):
         self.leaves = []
         self.drillable = False
         self.collapsed_frame = False
+        self.bundle_members = None
+        self.bundle_member_eids = []
 
     @property
     def frame_path(self):
@@ -1602,8 +1151,7 @@ def _attach_scope_portals(fg, bundle, scope_path, scope_range, level,
         if head is None:
             continue  # resource has no presence inside the scope
         for eid, uname, acc in outside_events[res_key]:
-            # producer -> imported head only from writes BEFORE the scope
-            # (a later write is a different version, not this input)
+            # producer edge for eid < scope_start
             if (acc in (WRITE, RW) and head.imported
                     and eid < scope_range[0]):
                 portal = portal_for(eid, ROLE_PRODUCER)
@@ -1624,8 +1172,55 @@ def _attach_scope_portals(fg, bundle, scope_path, scope_range, level,
     fg.passes = list(fg.passes) + portal_list
 
 
+def _partition_scope_usage(usage, scope_range):
+    """Split each resource's events into those inside the scope's eid range and
+    a (reads, writes) tally of outside activity. Returns (scoped_usage, outside,
+    outside_events), the last keeping the outside (eid, uname, access) triples
+    for portal routing."""
+    scoped_usage = {}
+    outside = {}
+    outside_events = {}
+    for res_key, evs in usage.items():
+        inside_evs = []
+        out_r = 0
+        out_w = 0
+        for eid, uname in evs:
+            acc = usage_access.direction(uname)
+            if scope_range is None or scope_range[0] <= eid <= scope_range[1]:
+                inside_evs.append((eid, uname))
+            elif acc != IGNORE:
+                if acc in (READ, RW):
+                    out_r += 1
+                if acc in (WRITE, RW):
+                    out_w += 1
+                outside_events.setdefault(res_key, []).append(
+                    (eid, uname, acc))
+        if inside_evs:
+            scoped_usage[res_key] = inside_evs
+        outside[res_key] = (out_r, out_w)
+    return scoped_usage, outside, outside_events
+
+
+def _annotate_outside_activity(fg, outside, outside_events):
+    """Stamp each resource with its out-of-scope reader/writer counts and the
+    identity (eid set) of its external writers."""
+    ow_eids = {}
+    for res_key, evs in outside_events.items():
+        s = set(eid for (eid, _u, acc) in evs if acc in (WRITE, RW))
+        if s:
+            ow_eids[res_key] = frozenset(s)
+    for node in fg.resources:
+        out_r, out_w = outside.get(node.res_key, (0, 0))
+        node.outside_readers = out_r
+        node.outside_writers = out_w
+        node.outside_write_eids = ow_eids.get(node.res_key, frozenset())
+        node.scope_input = bool(node.imported and out_w > 0)
+        if out_r > 0:
+            node.internal = False  # consumed elsewhere in the frame
+
+
 def build_scoped(bundle, scope_path, scope_range, versioned=True,
-                 bundling=False, make_portals=True, shader_access=None):
+                 bundling=False, make_portals=True):
     """Focus view: build ONE level of children inside a scope. A scope is a
     marker INSTANCE (absolute path + the contiguous eid range of that
     occurrence; same-named markers elsewhere are different instances).
@@ -1654,73 +1249,17 @@ def build_scoped(bundle, scope_path, scope_range, versioned=True,
         deeper = any(len(l.marker_path) > level + 1 for l in p.leaves)
         p.drillable = deeper or len(p.leaves) >= 2
 
-    usage = bundle['usage_by_res']
-    if shader_access:
-        # shader access is async/incremental -> apply to a copy, never the bundle
-        usage = dict((k, list(v)) for k, v in usage.items())
-        _apply_shader_access(usage, shader_access)
-    scoped_usage = {}
-    outside = {}
-    outside_events = {}
-    for res_key, evs in usage.items():
-        inside_evs = []
-        out_r = 0
-        out_w = 0
-        for eid, uname in evs:
-            acc = USAGE_ACCESS.get(uname, IGNORE)
-            if scope_range is None or scope_range[0] <= eid <= scope_range[1]:
-                inside_evs.append((eid, uname))
-            elif acc != IGNORE:
-                if acc in (READ, RW):
-                    out_r += 1
-                if acc in (WRITE, RW):
-                    out_w += 1
-                outside_events.setdefault(res_key, []).append(
-                    (eid, uname, acc))
-        if inside_evs:
-            scoped_usage[res_key] = inside_evs
-        outside[res_key] = (out_r, out_w)
-
-    # Present has no GetUsage event; count an out-of-scope present as an
-    # external reader so the swapchain isn't misclassified as internal.
-    for leaf in bundle['leaves']:
-        if leaf.kind != KIND_PRESENT or leaf.copy_src is None:
-            continue
-        if scope_range is not None and (
-                scope_range[0] <= leaf.eid <= scope_range[1]):
-            continue
-        res_key = leaf.copy_src
-        if res_key not in bundle['res_info']:
-            continue
-        out_r, out_w = outside.get(res_key, (0, 0))
-        outside[res_key] = (out_r + 1, out_w)
-        outside_events.setdefault(res_key, []).append(
-            (leaf.eid, 'Present', READ))
+    scoped_usage, outside, outside_events = _partition_scope_usage(
+        bundle['usage_by_res'], scope_range)
 
     fg = build_graph(passes, scoped_usage, bundle['res_info'],
                      bundle['res_names'], versioned=versioned,
                      externally_written=set(
                          k for k, (_r, w) in outside.items() if w > 0),
                      boundaries=bundle.get('pass_boundaries'))
-    # outside-writer identity: eids writing each resource beyond this scope.
-    # Inputs fed by DIFFERENT external writers are different behaviours and
-    # must not bundle even though the in-view writer set collapses to empty.
-    ow_eids = {}
-    for res_key, evs in outside_events.items():
-        s = set(eid for (eid, _u, acc) in evs if acc in (WRITE, RW))
-        if s:
-            ow_eids[res_key] = frozenset(s)
-    for node in fg.resources:
-        out_r, out_w = outside.get(node.res_key, (0, 0))
-        node.outside_readers = out_r
-        node.outside_writers = out_w
-        node.outside_write_eids = ow_eids.get(node.res_key, frozenset())
-        node.scope_input = bool(node.imported and out_w > 0)
-        if out_r > 0:
-            node.internal = False  # consumed elsewhere in the frame
+    _annotate_outside_activity(fg, outside, outside_events)
 
-    # ---- bundling in the parse layer (before portals) so every consumer -
-    # graph, portal targets, jump focus - sees ONE merged result
+    # ---- pre-portal bundling
     if bundling:
         bundle_equivalent_resources(fg)
         bundle_equivalent_passes(fg)
@@ -1732,14 +1271,7 @@ def build_scoped(bundle, scope_path, scope_range, versioned=True,
         _attach_scope_portals(fg, bundle, scope_path, scope_range, level,
                               outside_events, versioned, bundling)
 
-    fg.warnings = list(bundle['warnings']) + fg.warnings
-    fg.rid_objects = bundle['rid_objects']
-    fg.stats = {
-        'passes': len(fg.passes),
-        'resources': len(fg.resources),
-        'edges': len(fg.edges),
-        'seconds': bundle['seconds'],
-    }
+    _finalize_from_bundle(fg, bundle)
     return fg
 
 
@@ -1853,8 +1385,7 @@ def bundle_equivalent_resources(fg, min_members=BUNDLE_MIN_MEMBERS):
     if not remap:
         return fg
     fg.resources = new_resources
-    fg.edges = _remap_edges(fg.edges, remap)
-    fg.rank_edges = _remap_edges(fg.rank_edges, remap)
+    _apply_node_remap(fg, remap)
     _collapse_bundle_generations(fg)
     return fg
 
@@ -1900,8 +1431,7 @@ def _collapse_bundle_generations(fg, threshold=GENERATION_COLLAPSE_THRESHOLD):
     if not remap:
         return fg
     fg.resources = [n for n in fg.resources if n.id not in drop]
-    fg.edges = _remap_edges(fg.edges, remap)
-    fg.rank_edges = _remap_edges(fg.rank_edges, remap)
+    _apply_node_remap(fg, remap)
     return fg
 
 
@@ -1927,17 +1457,21 @@ def _remap_edges(edge_list, remap):
     return out
 
 
+def _apply_node_remap(fg, remap, remap_orphans=False):
+    """Re-point every edge (and optionally orphan-pass ids) through a node-id
+    remap, in place. Only pass-bundling remaps pass ids, so remap_orphans is
+    opt-in (resource bundling and generation collapse touch no pass ids)."""
+    fg.edges = _remap_edges(fg.edges, remap)
+    fg.rank_edges = _remap_edges(fg.rank_edges, remap)
+    if remap_orphans and fg.orphan_pass_ids:
+        fg.orphan_pass_ids = set(remap.get(i, i) for i in fg.orphan_pass_ids)
+
+
 _PASS_SUFFIX_RE = re.compile(r'\s+#\d+$')
 
 
 def bundle_equivalent_passes(fg, min_members=BUNDLE_MIN_MEMBERS):
-    """PASS bundling, the mirror of resource bundling. Leaf-level passes merge
-    when edge structure is identical (kind, read set, written set) and names
-    are similar; the auto-bucket ' #N' suffix is stripped before signing.
-    Drillable/portal/present nodes never merge. Run AFTER
-    bundle_equivalent_resources so groups compare merged resource ids. The
-    first member is mutated into the bundle (id and edges reused);
-    bundle_members/bundle_member_eids are parallel lists for display and jumps."""
+    """Bundle equivalent leaf-level passes by edge structure and name."""
     reads = {}
     writes = {}
     for e in fg.edges:
@@ -1962,8 +1496,7 @@ def bundle_equivalent_passes(fg, min_members=BUNDLE_MIN_MEMBERS):
         if eligible(p):
             groups.setdefault(group_key(p), []).append(p)
 
-    # merged passes must be CONSECUTIVE in execution order: split each group
-    # into consecutive runs and only merge runs still reaching the threshold
+    # split each group into consecutive execution runs
     pos = {}
     for i, p in enumerate(sorted(fg.passes, key=lambda q: q.order)):
         pos[p.id] = i
@@ -2009,17 +1542,5 @@ def bundle_equivalent_passes(fg, min_members=BUNDLE_MIN_MEMBERS):
     if not remap:
         return fg
     fg.passes = new_passes
-    fg.edges = _remap_edges(fg.edges, remap)
-    fg.rank_edges = _remap_edges(fg.rank_edges, remap)
-    if getattr(fg, 'orphan_pass_ids', None):
-        fg.orphan_pass_ids = set(
-            remap.get(i, i) for i in fg.orphan_pass_ids)
+    _apply_node_remap(fg, remap, remap_orphans=True)
     return fg
-
-
-def build_frame_graph(controller, include_buffers=True, versioned=False,
-                      marker_depth=None, candidates=None):
-    """Convenience for scripts: extract + build in one call. Replay thread."""
-    return build_from_bundle(
-        extract_bundle(controller, include_buffers, candidates=candidates),
-        marker_depth, versioned)

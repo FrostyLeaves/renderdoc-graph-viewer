@@ -1,0 +1,17 @@
+# Transfer: a compute pass fills Src, then a copy moves Src -> Dst. Exercises the
+# transfer pass category and CopySrc/CopyDst usage (Src read, Dst write).
+name: transfer
+
+resources:
+  Src: { kind: buffer, elements: 256 }
+  Dst: { kind: buffer, elements: 256 }
+
+passes:
+  - name: Fill
+    type: compute
+    bind:
+      - { res: Src, bind: uav_buf, access: write }
+
+  - name: Copy
+    type: transfer
+    copy: { src: Src, dst: Dst }

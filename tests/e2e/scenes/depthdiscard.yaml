@@ -1,0 +1,13 @@
+# Final graphics pass uses depth storeOp=DONT_CARE ahead of capture-end Present.
+# The depth Discard belongs to the renderpass END boundary.
+name: depthdiscard
+
+resources:
+  Albedo: { kind: color, size: [64, 64], format: rgba8 }
+  Depth:  { kind: depth, size: [64, 64], format: d32 }
+
+passes:
+  - name: Shade
+    type: graphics
+    color: [Albedo]
+    depth: { res: Depth, access: rw, store: dont_care }
