@@ -7,18 +7,10 @@ unit-testable without PySide2."""
 
 from .. import config as _config
 from ..graph_model import CAT_PORTAL
-
-# Selection/filter styling policy (Qt-free numeric tiers the widget applies).
-# Below ~0.3 a white node face vanishes into the light canvas while its edges
-# stay visible (lines look severed), so keep unrelated nodes legible.
-DIM_OPACITY = 0.4              # node outside the selected node's closure
-FILTER_DIM_OPACITY = 0.35      # node whose label misses the filter text
-# muted context edges stay more present than dimmed nodes so grey lines stay
-# traceable; indirect edges keep their hue but fade
-MUTED_EDGE_OPACITY = 0.9
-EDGE_INDIRECT_OPACITY = 0.55
-Z_NODE_BASE = 0.0
-Z_NODE_HI = 3.0                # selected closure floats above unrelated nodes
+from .style import (
+    DIM_OPACITY, FILTER_DIM_OPACITY, MUTED_EDGE_OPACITY,
+    EDGE_INDIRECT_OPACITY, Z_NODE_BASE, Z_NODE_HI,
+)
 
 
 def filter_visible(graph, display):

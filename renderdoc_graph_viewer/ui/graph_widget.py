@@ -20,8 +20,19 @@ from ..graph_model import (
 from ..i18n import tr
 from . import anchors
 from . import sizing
-from .sizing import (PAD, TITLE_H, SUBLINE_H, BADGE_W, BUNDLE_ROW_H,
-                     BUNDLE_MAX_ROWS, PASS_BUNDLE_ROWS_Y, THUMB_W, THUMB_H)
+from .style import (
+    CAT_BASE_COLORS as _CAT_BASE,
+    EDGE_BASE_COLORS as _EDGE_BASE,
+    CANVAS_DARK_LIGHTEN, CANVAS_LIGHT_DARKEN,
+    SHADOW_ALPHA_DARK, SHADOW_ALPHA_LIGHT, SUB_TEXT_MIX,
+    CATEGORY_DARK_LIGHTEN, EDGE_DARK_LIGHTEN, EDGE_ALPHA, EDGE_MUTED_MIX,
+    TITLE_TINT_PASS_MIX, TITLE_TINT_RESOURCE_MIX, RESOURCE_BORDER_MIX,
+    PAD, TITLE_H, SUBLINE_H, BADGE_W, BUNDLE_ROW_H, BUNDLE_MAX_ROWS,
+    PASS_BUNDLE_ROWS_Y, THUMB_W, THUMB_H, ICON_SZ, SCOPE_STACK_OFF,
+    EDGE_W_BASE, EDGE_W_DIRECT, EDGE_W_INDIRECT,
+    Z_EDGE_BASE, Z_EDGE_INDIRECT, Z_EDGE_DIRECT,
+    CLICK_SLOP, LAYOUT_CACHE_CAP, ZOOM_STEP, ZOOM_MIN, ZOOM_MAX, READABLE_ZOOM,
+)
 from . import tooltip
 from . import visibility
 from . import config_state
@@ -34,38 +45,6 @@ def _mix(a, b, t):
         int(a.red() + (b.red() - a.red()) * t),
         int(a.green() + (b.green() - a.green()) * t),
         int(a.blue() + (b.blue() - a.blue()) * t))
-
-
-# Category base colours. Pass kinds get distinct hues (telling them apart
-# matters); resource kinds collapse into one blue-grey family except the
-# warm accents marking the frame's key outputs. Dark themes lighten the
-# bases. Loudness hierarchy: graphics > compute > resources.
-_CAT_BASE = {
-    CAT_GRAPHICS: '#E53935',   # vivid red - loudest on screen
-    CAT_COMPUTE: '#7B1FA2',    # deep purple, one step quieter
-    CAT_SCOPE: '#1976D2',      # vivid blue - drillable aggregate scopes
-    CAT_TRANSFER: '#78909C',   # blue grey, neutral helper
-    CAT_PRESENT: '#2E7D32',    # green - clear against blue/purple
-    CAT_PORTAL: '#AEC0C8',     # light grey; lighter than depth so the two
-                             # greys read apart under the 45% pass title tint
-    RES_COLOR: '#C0773B',      # ochre - warm but muted
-    RES_DEPTH: '#2E3C44',      # dark slate; deep enough to stay darker than
-                             # portal grey under the 28% res title tint
-    RES_UAV_TEX: '#78909C',    # blue-grey, middle step
-    RES_SWAPCHAIN: '#F9A825',  # bright gold - frame's final output, one/frame
-    RES_BUFFER: '#5C6BC0',     # indigo - non-grey so buffers don't blur into
-                             # depth / portal
-    RES_SAMPLED: '#B0BEC5',    # blue-grey, lightest - read-only assets
-}
-
-# read/write edge hues: teal vs rose, maximally separable inside this node
-# palette (no pink in the fills, so rose write never collides). Light mode
-# shows these verbatim; dark theme lightens both by 135%.
-_EDGE_BASE = {
-    READ: '#00897B',
-    WRITE: '#d74e80',
-}
-
 
 def _is_pass_node(node):
     return getattr(node, 'node_type', None) in (NODE_PASS, NODE_PORTAL)
@@ -82,18 +61,19 @@ class Theme(object):
         self.dark = window.lightnessF() < 0.5
         # canvas = panel (Window), nodes = content (Base); pushed away from
         # the node face so nodes pop at any zoom
-        self.canvas = (window.lighter(118) if self.dark
-                       else window.darker(120))
+        self.canvas = (window.lighter(CANVAS_DARK_LIGHTEN) if self.dark
+                       else window.darker(CANVAS_LIGHT_DARKEN))
         self.node_bg = base
-        self.shadow = QtGui.QColor(0, 0, 0, 150 if self.dark else 105)
+        self.shadow = QtGui.QColor(
+            0, 0, 0, SHADOW_ALPHA_DARK if self.dark else SHADOW_ALPHA_LIGHT)
         self.node_border = palette.color(QtGui.QPalette.Mid)
         self.text = text
-        self.sub_text = _mix(text, base, 0.42)
+        self.sub_text = _mix(text, base, SUB_TEXT_MIX)
         self.highlight = palette.color(QtGui.QPalette.Highlight)
 
         def cat(name):
             col = QtGui.QColor(_CAT_BASE[name])
-            return col.lighter(130) if self.dark else col
+            return col.lighter(CATEGORY_DARK_LIGHTEN) if self.dark else col
 
         self.pass_colors = dict(
             (k, cat(k))
@@ -109,48 +89,29 @@ class Theme(object):
         self.read = QtGui.QColor(_EDGE_BASE[READ])
         self.write = QtGui.QColor(_EDGE_BASE[WRITE])
         if self.dark:
-            self.read = self.read.lighter(135)
-            self.write = self.write.lighter(135)
-        self.read.setAlpha(245)
-        self.write.setAlpha(245)
+            self.read = self.read.lighter(EDGE_DARK_LIGHTEN)
+            self.write = self.write.lighter(EDGE_DARK_LIGHTEN)
+        self.read.setAlpha(EDGE_ALPHA)
+        self.write.setAlpha(EDGE_ALPHA)
         # edges outside a selected node's subgraph go neutral grey; keeping
         # the dimmed hue made crossing lines cluttered
-        self.edge_muted = _mix(self.sub_text, self.canvas, 0.58)
+        self.edge_muted = _mix(self.sub_text, self.canvas, EDGE_MUTED_MIX)
 
     def title_tint(self, cat, strong=True):
         """Category wash for the node title row (Event Browser marker-row
         language). Passes 45% colour, resources 28%."""
-        t = 0.55 if strong else 0.72
+        t = TITLE_TINT_PASS_MIX if strong else TITLE_TINT_RESOURCE_MIX
         return _mix(cat, self.node_bg, t)
 
     def cat_border(self, cat, strong=True):
         """Pass borders draw full category colour; resource borders blend
         halfway into the neutral border."""
-        return cat if strong else _mix(cat, self.node_border, 0.5)
+        return cat if strong else _mix(cat, self.node_border, RESOURCE_BORDER_MIX)
 
 
-# selection-focus edge widths: direct in/out bold and on top; indirect keep
-# their hue but faded. The opacity tiers and node z-levels live in
-# visibility.py with the visual_state decision that applies them.
-EDGE_W_BASE = 1.6
-EDGE_W_DIRECT = 2.8
-EDGE_W_INDIRECT = 1.5
-# edge z-order low -> high: muted edge < (node base) < indirect edge < direct
-Z_EDGE_BASE = -1.0
-Z_EDGE_INDIRECT = 1.0
-Z_EDGE_DIRECT = 2.0
-_SCOPE_STACK_OFF = (6.0, 3.0)
-ICON_SZ = 14.0   # eye / range hit square
-# node geometry (PAD/TITLE_H/BADGE_W/THUMB_*/BUNDLE_*/PASS_BUNDLE_ROWS_Y) lives
-# in sizing.py with the node_size math; imported above for painting.
-CLICK_SLOP = 6.0    # click/drag threshold in pixels
-_LAYOUT_CACHE_CAP = 48    # LRU layouts kept so revisiting a view stays free
-
-# Zoom bounds + step, shared by Ctrl+wheel and Ctrl+Up/Down
-ZOOM_STEP = 1.15
-ZOOM_MIN = 0.1
-ZOOM_MAX = 4.0
-_READABLE_ZOOM = 0.8   # below this, focusing snaps back to 1:1 for legibility
+_SCOPE_STACK_OFF = SCOPE_STACK_OFF
+_LAYOUT_CACHE_CAP = LAYOUT_CACHE_CAP
+_READABLE_ZOOM = READABLE_ZOOM
 
 
 def _text_width(fm, text):

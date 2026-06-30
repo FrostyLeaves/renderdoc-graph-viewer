@@ -1,21 +1,14 @@
 # -*- coding: utf-8 -*-
 """Pure node-sizing geometry: the (width, height) of a pass or resource node
 from its model data. Qt-free — callers inject a text-width measure and an
-is-expanded predicate — so the layout math is natively testable. The geometry
-constants live here; graph_widget imports them back for painting."""
+is-expanded predicate — so the layout math is natively testable."""
 
 from ..graph_model import CAT_PORTAL, RES_BUFFER
 from ..i18n import tr
-
-PAD = 8.0
-TITLE_H = 20.0
-SUBLINE_H = 18.0        # EID / dims sub-row height under the title
-BADGE_W = 26.0          # version-badge box reserved on a resource title row
-BUNDLE_ROW_H = 15.0     # one row per bundled member name
-BUNDLE_MAX_ROWS = 24    # beyond this an overflow row summarises the rest
-PASS_BUNDLE_ROWS_Y = 42.0   # member rows start below the title + EID rows
-THUMB_W = 192
-THUMB_H = 108
+from .style import (
+    PAD, TITLE_H, SUBLINE_H, BADGE_W, BUNDLE_ROW_H, BUNDLE_MAX_ROWS,
+    PASS_BUNDLE_ROWS_Y, THUMB_W, THUMB_H,
+)
 
 
 def measure_member_rows(text_width, members, w0):

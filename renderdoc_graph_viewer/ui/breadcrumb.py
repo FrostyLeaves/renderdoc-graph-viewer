@@ -3,8 +3,7 @@
 string the panel's QLabel shows. Qt-free (it only builds an HTML string), so the
 escaping and the current-vs-link markup are unit-testable without PySide2."""
 
-SEP = u' ▸ '
-LINK_COLOR = '#7ab0e0'       # link blue for clickable scope segments
+from .style import BREADCRUMB_SEP as SEP, BREADCRUMB_LINK_COLOR as LINK_COLOR
 
 
 def _escape(text):

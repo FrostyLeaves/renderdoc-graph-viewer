@@ -6,9 +6,10 @@ unit-testable without PySide2."""
 
 from ..graph_model import NODE_PASS, NODE_PORTAL, CAT_PORTAL, RES_BUFFER
 from ..i18n import tr
-
-LIST_LIMIT = 20       # list row detail limit
-EDGE_EID_LIMIT = 10   # per-usage EIDs shown in an edge tooltip
+from .style import (
+    TOOLTIP_LIST_LIMIT as LIST_LIMIT,
+    TOOLTIP_EDGE_EID_LIMIT as EDGE_EID_LIMIT,
+)
 
 
 def _is_pass_node(node):

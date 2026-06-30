@@ -4,8 +4,7 @@ i18n-aware, so the stats / hidden-count / warning composition is unit-testable
 even though the controller that uses it only runs inside qrenderdoc."""
 
 from ..i18n import tr
-
-WARNING_TOOLTIP_LIMIT = 20   # warning tooltip detail limit
+from .style import WARNING_TOOLTIP_LIMIT
 
 
 def format_warning_tooltip(warnings, limit=WARNING_TOOLTIP_LIMIT):
