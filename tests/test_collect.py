@@ -64,6 +64,18 @@ class TestCollectLeaves(unittest.TestCase):
         self.assertEqual(len(leaves), 1)
         self.assertEqual(leaves[0].eid, 10)
 
+    def test_multiaction_container_collects_child_dispatch(self):
+        # ExecuteIndirect is a MultiAction container with no draw/dispatch kind
+        # of its own; the child IndirectDispatch is the collected executable.
+        dispatch = FakeAction(11, AF.Dispatch, name='IndirectDispatch')
+        execute = FakeAction(10, AF.MultiAction | AF.PushMarker,
+                             name='ExecuteIndirect(maxCount 1)',
+                             children=[dispatch])
+        leaves = collect([execute])
+        self.assertEqual(len(leaves), 1)
+        self.assertEqual(leaves[0].eid, 11)
+        self.assertEqual(leaves[0].kind, 'dispatch')
+
     def test_plain_grouping_node_recursed(self):
         d = FakeAction(10, AF.Dispatch)
         grp = FakeAction(1, 0, name='Command Buffer 0xDEAD', children=[d])

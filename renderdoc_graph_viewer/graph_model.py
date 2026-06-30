@@ -584,7 +584,9 @@ def build_graph(passes, usage_by_res, res_info, res_names=None, versioned=False,
 
 def _collect_leaves(rd, roots, sdfile, key_of, present_resolver=None):
     """Flatten the action tree into LeafAction IR. Recurse into PushMarker
-    regions and grouping nodes; MultiAction stays a single leaf. Only semantic
+    regions and grouping nodes; a MultiAction with its own draw/dispatch kind
+    stays a single leaf, while a kind-less MultiAction container is recursed
+    so its child executable is kept. Only semantic
     debug markers contribute to marker_path - API-structure groupings
     (vkQueueSubmit, render-pass regions, command buffers) are recursed but
     excluded so pass names stay meaningful.
@@ -644,7 +646,10 @@ def _collect_leaves(rd, roots, sdfile, key_of, present_resolver=None):
             kind = KIND_PRESENT
 
         children = list(act.children)
-        if children and not (f & f_multi) and (kind is None or (f & f_push)):
+        # Recurse into marker, grouping, and kind-less container nodes.
+        # MultiAction nodes with their own draw/dispatch kind stay as leaves.
+        if (children and (kind is None or (f & f_push)) and
+                not (f & f_multi and kind is not None)):
             newpath = path
             if f & f_push:
                 nm = action_name(act)
